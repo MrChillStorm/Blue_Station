@@ -1,0 +1,256 @@
+# Blue Station
+
+A live Bluetooth Low Energy scanner, with one page per job. Pick the job
+at the top and you get only what that job needs:
+
+- **Scan**: every device around you, each with a live signal bar and
+  the number beside it. Hover a device for its details.
+- **Trackers**: AirTags and other item trackers, and whether one is
+  following you.
+- **Survey**: check that beacons are alive, and map coverage on a floor
+  plan.
+- **Develop**: one device, the way its firmware's author sees it:
+  packet timing, payload changes, a packet log, and GATT with live
+  notifications.
+
+Clicking a device in any job opens its own page. There you can track it,
+which helps you find something you've lost.
+
+![Scan: the device list with live signal bars, and the hover card over one device with its last minute of signal](docs/devices.png)
+
+*The screenshots show the made-up devices of `blue-station --demo`.*
+
+Built with Python, PySide6 (Qt) and [bleak](https://github.com/hbldh/bleak).
+It never writes to a device, and nothing leaves your computer.
+
+## Install & run
+
+You need Python 3.10 or newer.
+
+**As an app you start with `blue-station`**, from anywhere. The easiest
+way is [pipx](https://pipx.pypa.io) (`brew install pipx` on macOS):
+
+```bash
+pipx install git+https://github.com/MrChillStorm/Blue_Station.git
+blue-station
+```
+
+`blue-station --demo` fills the room with made-up devices, a made-up
+morning for the tracker watch, and a heart rate strap to connect to. Use
+it to try every job without Bluetooth.
+
+**From a clone**, which is also what `Blue Station.app` uses:
+
+```bash
+git clone https://github.com/MrChillStorm/Blue_Station.git
+cd Blue_Station
+pip install -r requirements.txt
+python3 -m blue_station
+```
+
+Or double-click **Blue Station.app** in the folder. It uses your
+`python3`, so install the packages first. The app bundle has to
+stay in this folder, because it starts the code next to it. If you
+downloaded a ZIP and macOS refuses to open the app, right-click it and
+choose Open once.
+
+**Bluetooth permission (macOS).** The first scan makes macOS ask whether
+the app may use Bluetooth. From the app bundle, it asks for *Blue
+Station*. From a terminal, it asks for the terminal app instead. If you
+said no, allow it in System Settings → Privacy & Security → Bluetooth
+and press Scan.
+
+Blue Station is built and used on macOS. bleak also works on Windows and
+Linux, and the app is plain Qt, so it should run there too (⌘ means
+Ctrl), but only macOS has been tried.
+
+## Scan
+
+Everything heard in the last 30 seconds, strongest first.
+
+- **What each device is and who made it**, from its name, its services
+  and the maker's data in its packets. For example: AirPods and Beats
+  with their battery levels, iBeacons with their major and minor,
+  Eddystone beacons with their URL and battery, Find My devices, Tile,
+  SmartTag and Google tags, Windows PCs, Fast Pair accessories, heart
+  rate straps, cycling sensors.
+- **A live signal bar and its number** in dBm. Green is excellent (−55
+  and up), blue good, amber fair, red weak (below −80). The number is
+  smoothed over about a second and a half, so it follows you without
+  flickering.
+- **A rough distance**, and when a packet was last heard. Devices that
+  go quiet fade out. **Show out of range** keeps them listed.
+
+**Hover** a device for its card: the last minute of signal as a
+sparkline, packets per second, the address, services and anything
+decoded. While the pointer is over the list, **the order holds still**,
+so a row never jumps away from your click. **☆** pins a device to the
+top, and Blue Station remembers it.
+
+## A device's own page
+
+![A device's own page: big live signal and trend, rough distance, statistics, signal history, the decoded advertisement and what the device said about itself](docs/tracking.png)
+
+- **A big live signal with its trend**: *Getting closer*, *Moving away*
+  or *Holding steady*. To find something, walk around and follow the
+  green.
+- **Rough distance.** **Calibrate at 1 m** makes it much better for
+  that device: hold it a metre away for a few seconds and click.
+- **Statistics, and the signal's history** over 1, 5 or 15 minutes.
+  Point at the chart to read any packet.
+- **The advertisement**, raw and decoded.
+- **Connect and read** fetches the standard information: name, maker,
+  model, serial number, firmware and battery.
+- The **pencil** gives it a name of your own, and **Export** saves its
+  signal log as CSV.
+
+## Trackers
+
+![Trackers: one tracker following you, with the time it has been with you and the places it has been seen](docs/trackers.png)
+
+Item trackers around you: AirTags and other Find My devices away from
+their owner, Tile, SmartTag, Chipolo and Google's tags. Each one shows
+how long it has been with you, in how many places, and a verdict:
+*Passing by*, *Staying near you* (20 minutes in one place, like a
+neighbour's tag) or **Following you**.
+
+- **Following you** means it has been with you in two different places.
+  Then the job button turns red, the status bar says so, and macOS
+  shows a notification. Click the tracker to find it with its own page.
+- **Places without GPS.** A laptop has no GPS, so Blue Station
+  recognizes places by their **landmarks**: named devices that stay put,
+  like TVs, printers and speakers. When most of the landmarks around you
+  are new, you've moved. That takes a few minutes after you arrive. Your
+  own phone and earbuds come along everywhere, so it learns them as
+  companions and stops counting them. **I've moved** tells it straight
+  away.
+- While you're between places, nothing is credited to a place. So a
+  stranger's tag at a café can't be blamed on your home before the café
+  is recognized.
+- **It watches in the background**, whichever job is on screen, and
+  remembers what it has seen across restarts: trackers for 48 hours
+  (AirTags away from their owner keep their address for a day), places
+  for 60 days.
+
+## Survey
+
+![Survey: a floor plan with points where the signal was measured, colored by the strongest beacon at each spot](docs/survey.png)
+
+- **The beacon list** keeps every beacon heard this session. One that
+  stops broadcasting stays listed as *quiet*, so a dead battery shows up
+  while you walk. Untick **Beacons only** to survey any device.
+- **The map.** Load a floor plan (any image: a plan, a sketch, a photo
+  of the evacuation map), or work on the blank grid. Click where you
+  stand and hold still for five seconds. The next five seconds of
+  packets become a point. Repeat around the space. ⌘Z takes the last
+  point back.
+- **What the map shows**, switchable at any time, because every point
+  keeps every device's reading:
+  - **Picked device**: one device's signal (click it in the list).
+  - **Strongest**: the best signal of the listed devices at each spot.
+    This shows coverage holes.
+  - **How many**: how many listed devices are heard at −85 dBm or
+    better. Three or more is what indoor positioning usually needs.
+- The colors fade away from where you measured, so the map never claims
+  more than you walked. **Export** saves the map as PNG or the points as
+  CSV.
+
+## Develop
+
+![Develop: packet timing and payload, a packet log recording one device, and the GATT explorer following a heart rate](docs/develop.png)
+
+Pick a device on the left.
+
+- **Packets**: rate, the shortest common gap and the median gap between
+  heard packets, how often the payload changes, and a histogram of the
+  gaps. macOS passes on only some of a device's packets, so the real
+  advertising interval is the shortest gap or shorter. A Mac can't see
+  intervals much under half a second.
+- **Latest payload**, with the bytes that just changed highlighted.
+  Counters and sensor values stand out at a glance.
+- **Packet log**: off until you press **Record**, so nothing piles up.
+  It records this device (or **All devices**) exactly as heard, keeps
+  the last 100 000 packets, and exports to CSV. The table follows the
+  newest packets while it's scrolled to the top.
+- **GATT**: **Connect** and stay connected. Browse every service,
+  **Read** any characteristic, and **Follow** notifications live.
+  Heart rate, battery, temperature and other standard values are
+  decoded, and everything else shows as hex. Reading a protected
+  characteristic may make macOS ask to pair.
+
+## Good to know
+
+- Distances are rough. Walls, bodies and pockets easily halve or double
+  them. The trend and the signal itself are the reliable parts.
+- macOS passes on each device's packets about once or twice a second.
+  How often depends on the device, and not on whether Blue Station is
+  in front or the Mac is on battery. So "live" means about once a
+  second: plenty for finding things and watching trends.
+- Phones and many other devices change their Bluetooth address every
+  few minutes for privacy, so one phone can show up as several devices
+  over an afternoon.
+- macOS shows each device under an address of its own making (a UUID
+  that's the same only on your Mac). Where it can, Blue Station also
+  shows the real Bluetooth address.
+- The AirPods, Find My, Apple activity and Windows readings come from
+  community research, not from published specifications. They are good
+  hints, not guarantees. The same goes for the tracker verdicts. A
+  *Following you* is worth checking, and it's no proof.
+
+## Keys
+
+| Keys | Does |
+|---|---|
+| ⌘1 – ⌘4 | Scan, Trackers, Survey, Develop |
+| Space | Scan or pause |
+| ⌘F | Filter the list |
+| Enter | Open the selected device |
+| Esc | Back from a device, or clear the filter |
+| ⌘Z | Take back the last survey point |
+| ⌘E | Export what's on screen |
+
+The gear menu has the appearance (dark by default, light, or following
+the system), **Export device list…**, **Clear list** and help.
+
+## Your data
+
+Nothing is recorded unless you export it, except two small files kept in
+your system's usual place for app data:
+
+- `settings.json`: settings, and the names, pins and calibrations you
+  give devices.
+- `trackers.json`: the tracker watch's memory, meaning which trackers
+  it has seen, and the landmarks of your places (the per-Mac IDs of
+  named devices). Nothing else about where you are. **Forget history**
+  on the Trackers page empties it.
+
+| System | Folder |
+|---|---|
+| macOS | `~/Library/Application Support/Blue Station` |
+| Windows | `C:\Users\<you>\AppData\Local\Blue Station` |
+| Linux | `~/.local/share/Blue Station` (or `$XDG_DATA_HOME/Blue Station`) |
+
+Set `BLUE_STATION_SETTINGS=/some/other.json` to use another settings
+file. `trackers.json` then goes next to it.
+
+## Development
+
+```bash
+pip install -e .                     # the `blue-station` command, running this checkout
+python3 -m unittest discover tests   # core and interface tests (offscreen, no Bluetooth needed)
+python3 packaging/build_icon.py      # rebuild the app icon after editing packaging/icon.svg
+```
+
+- `blue_station/core/` has no Qt:
+  - `scanner.py`: bleak on a background thread, and the demo
+  - `devices.py`: each device's history, smoothing, statistics, distance, trend and packet gaps
+  - `decode.py`: what an advertisement says (kinds, makers, beacons, Apple, Microsoft...)
+  - `watch.py`: trackers, places and landmarks
+  - `survey.py`: survey points and the map's estimate
+  - `packets.py`: the packet log
+  - `gatt.py`: the quick read, and the lasting connection with notifications
+  - `names.py`: Bluetooth SIG names for companies, services and characteristics
+  - `prefs.py`: the settings files
+- `blue_station/ui/` is the PySide6 interface:
+  - `devices.py` (Scan), `trackers.py`, `survey.py`, `develop.py` and `track.py` (a device's own page)
+  - `window.py`, `widgets.py`, `theme.py` and `icons.py`: everything around them

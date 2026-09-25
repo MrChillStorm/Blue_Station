@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blue-station"
+version = "1.0.0"
+description = "A live Bluetooth Low Energy scanner: every device nearby with its signal, and a page to track one."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "MrChillStorm" }]
+requires-python = ">=3.10"
+dependencies = ["PySide6>=6.5", "bleak>=0.22", "bluetooth-numbers>=1.1", "platformdirs"]
+keywords = ["bluetooth", "ble", "scanner", "beacon", "pyside6", "qt"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: MacOS X",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/MrChillStorm/Blue_Station"
+
+# `blue-station` on the command line runs the same main() as `python3 -m blue_station`
+[project.gui-scripts]
+blue-station = "blue_station.app:main"
+
+[tool.setuptools.packages.find]
+include = ["blue_station*"]

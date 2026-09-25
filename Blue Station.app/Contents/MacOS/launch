@@ -1,0 +1,26 @@
+#!/bin/bash
+# The executable behind Blue Station.app. It runs the code in this folder
+# with python3 from a login shell of the user's own $SHELL (GUI-launched
+# apps don't get the PATH a Terminal has). Started from here, macOS asks
+# about Bluetooth on behalf of Blue Station itself, thanks to the
+# NSBluetoothAlwaysUsageDescription in Info.plist.
+DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+export DIR
+CHECK='import PySide6, bleak, bluetooth_numbers, platformdirs'
+
+USER_SHELL="${SHELL:-/bin/bash}"
+if "$USER_SHELL" -l -c "python3 -c '$CHECK'" 2>/dev/null; then
+    exec "$USER_SHELL" -l -c 'cd "$DIR" && exec python3 -m blue_station'
+fi
+
+osascript <<'APPLESCRIPT'
+display dialog "Blue Station needs a few Python packages first.
+
+In Terminal, in this folder, run:
+
+pip install -r requirements.txt
+
+then open the app again." with title "Blue Station" buttons {"OK"} default button "OK" with icon caution
+APPLESCRIPT
+open -a Terminal "$DIR"
+exit 1
