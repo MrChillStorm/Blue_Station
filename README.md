@@ -35,6 +35,11 @@ pipx install git+https://github.com/MrChillStorm/Blue_Station.git
 blue-station
 ```
 
+`pipx upgrade blue-station` gets each new release. To install one
+particular version instead, add its tag to the end, like
+`Blue_Station.git@v1.1.0`. pipx then keeps that version, and
+`pipx upgrade` won't move it.
+
 `blue-station --demo` fills the room with made-up devices, a made-up
 morning for the tracker watch, and a heart rate strap to connect to. Use
 it to try every job without Bluetooth.
