@@ -120,10 +120,12 @@ neighbour's tag) or **Following you**.
 - **Places without GPS.** A laptop has no GPS, so Blue Station
   recognizes places by their **landmarks**: named devices that stay put,
   like TVs, printers and speakers. When most of the landmarks around you
-  are new, you've moved. That takes a few minutes after you arrive. Your
-  own phone and earbuds come along everywhere, so it learns them as
-  companions and stops counting them. **I've moved** tells it straight
-  away.
+  are new, you've moved. That takes a few minutes after you arrive, and
+  **I've moved** tells it straight away. A named device that came along
+  from the last place, like your phone, can't describe a place, so it
+  stops being used as a landmark. That's all it changes: it's still
+  watched like any other device. Only you can say a device is yours,
+  with **This is mine**.
 - While you're between places, nothing is credited to a place. So a
   stranger's tag at a café can't be blamed on your home before the café
   is recognized.
@@ -131,6 +133,17 @@ neighbour's tag) or **Following you**.
   remembers what it has seen across restarts: trackers for 48 hours
   (AirTags away from their owner keep their address for a day), places
   for 60 days.
+- **Watch for** adds other kinds of device: headphones and earbuds,
+  watches, bands and health devices, phones and tablets, or anything
+  else that could travel. TVs, speakers and beacons stay put, so they're
+  never watched. Most phones, AirPods and watches change their Bluetooth
+  address every 15 minutes or so, so they can't be followed from place
+  to place. Devices that keep their address can, like many fitness
+  bands, cheap earbuds and GPS trackers. Devices of those kinds that
+  only passed by are forgotten after 3 hours.
+- **This is mine**, on a device's own page, leaves one of your own
+  devices alone. **Watch my devices again** in the Watch for menu undoes
+  it for all of them.
 
 ## Survey
 
@@ -220,9 +233,10 @@ your system's usual place for app data:
 - `settings.json`: settings, and the names, pins and calibrations you
   give devices.
 - `trackers.json`: the tracker watch's memory, meaning which trackers
-  it has seen, and the landmarks of your places (the per-Mac IDs of
-  named devices). Nothing else about where you are. **Forget history**
-  on the Trackers page empties it.
+  it has seen, which devices you said are yours, and the landmarks of
+  your places (the per-Mac IDs of named devices). Nothing else about
+  where you are. **Forget history** on the Trackers page empties it,
+  except for which devices are yours.
 
 | System | Folder |
 |---|---|

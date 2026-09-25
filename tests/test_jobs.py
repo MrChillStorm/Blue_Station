@@ -17,7 +17,8 @@ from blue_station.core.devices import Device, DeviceStore, Sighting, gap_stats
 from blue_station.core.packets import PacketLog
 from blue_station.core.scanner import Scanner
 from blue_station.core.survey import COUNT, DEVICE, HOLD, NOT_HEARD, STRONGEST, Point, Survey
-from blue_station.core.watch import FOLLOWING, PASSING, STAYING, Watcher
+from blue_station.core.decode import decode
+from blue_station.core.watch import DEFAULT_GROUPS, FOLLOWING, PASSING, STAYING, Watcher, group
 
 
 def uuid16(short: int) -> str:
@@ -26,14 +27,15 @@ def uuid16(short: int) -> str:
 
 FOLLOWER = {0x004C: bytes([0x12, 0x19, 0x10]) + bytes(24)}  # a Find My tag away from its owner
 TILE = (uuid16(0xFEED),)
+BAND = {"service_uuids": (uuid16(0x180D),)}  # a heart rate band, keeping its address
 
 
 class Walk:
     """Plays a day out: who is heard where, checked every 15 seconds."""
 
-    def __init__(self):
+    def __init__(self, groups=DEFAULT_GROUPS):
         self.store = DeviceStore()
-        self.watcher = Watcher()
+        self.watcher = Watcher(groups=groups)
 
     def stay(self, start: int, end: int, heard: dict[str, dict]) -> None:
         for t in range(start, end, 15):
@@ -112,6 +114,70 @@ class WatchTest(unittest.TestCase):
         watcher = Watcher({"trackers": [{"address": "T", "kind": "Tile tracker", "first_seen": 0, "last_seen": 0,
                                          "places": [7]}]})
         self.assertEqual(watcher.moved(10).id, 8)
+        self.assertEqual(watcher.trackers["T"].group, "trackers")  # saved before there were kinds to pick
+
+
+class WatchForTest(unittest.TestCase):
+    def test_kinds(self):
+        ibeacon = {0x004C: bytes.fromhex("0215" + "3b8f1c24a7e54d0b9c3f5e6a7b8c9d0e" + "0001002ac5")}
+        self.assertEqual(group(decode(None, FOLLOWER, [], {})), "trackers")
+        self.assertEqual(group(decode(None, {}, list(TILE), {})), "trackers")
+        self.assertEqual(group(decode(None, {}, list(BAND["service_uuids"]), {})), "wearables")
+        self.assertEqual(group(decode("Galaxy S24", {}, [], {})), "phones")
+        self.assertEqual(group(decode("WH-1000XM5", {}, [], {})), "headphones")
+        self.assertEqual(group(decode(None, {}, [], {})), "other")
+        for stays_put in (decode("Living Room TV", {}, [], {}), decode("Kitchen Speaker", {}, [], {}),
+                          decode(None, ibeacon, [], {})):
+            self.assertIsNone(group(stays_put))
+
+    def test_a_band_that_follows_you_counts_only_when_watched(self):
+        for groups, verdict in ((DEFAULT_GROUPS, None), (("trackers", "wearables"), FOLLOWING)):
+            walk = Walk(groups)
+            walk.stay(0, 900, {**HOME, "BAND": BAND})
+            walk.stay(900, 1500, {"BAND": BAND})
+            walk.stay(1500, 2400, {**CAFE, "BAND": BAND})
+            record = walk.watcher.record("BAND")
+            self.assertEqual(record and record.verdict, verdict)
+
+    def test_coming_along_never_makes_a_device_yours(self):
+        walk = Walk(("trackers", "wearables"))
+        band = {"name": "Band 7", **BAND}  # named, so it's also a landmark at home
+        walk.stay(0, 900, {**HOME, "BAND": band})
+        walk.stay(900, 1500, {"BAND": band})
+        walk.stay(1500, 2400, {**CAFE, "BAND": band})
+        self.assertIn("BAND", walk.watcher.companions)  # it describes no place any more...
+        self.assertEqual(walk.watcher.mine, set())
+        self.assertEqual(walk.verdict("BAND"), FOLLOWING)  # ... and is still flagged
+
+    def test_turning_a_kind_off_hides_it_but_keeps_it(self):
+        walk = Walk(("trackers", "wearables"))
+        walk.stay(0, 300, {**HOME, "BAND": BAND})
+        walk.watcher.set_groups(DEFAULT_GROUPS)
+        self.assertIsNone(walk.watcher.record("BAND"))
+        self.assertEqual(walk.watcher.watched(), [])
+        walk.watcher.set_groups(("trackers", "wearables"))
+        self.assertEqual(walk.watcher.record("BAND").group, "wearables")
+
+    def test_yours_is_left_alone(self):
+        walk = Walk(("trackers", "wearables"))
+        walk.stay(0, 300, {**HOME, "BAND": BAND})
+        walk.watcher.set_mine("BAND")
+        self.assertNotIn("BAND", walk.watcher.trackers)
+        walk.stay(300, 600, {**HOME, "BAND": BAND})
+        self.assertNotIn("BAND", walk.watcher.trackers)
+        self.assertEqual(Watcher(walk.watcher.to_dict()).mine, {"BAND"})
+        walk.watcher.forget()
+        self.assertEqual(walk.watcher.mine, {"BAND"})  # forgetting what it has seen keeps what's yours
+        walk.watcher.set_mine("BAND", False)
+        walk.stay(600, 700, {**HOME, "BAND": BAND})
+        self.assertIsNotNone(walk.watcher.record("BAND"))
+
+    def test_other_kinds_that_passed_by_are_forgotten_sooner(self):
+        walk = Walk(("trackers", "phones"))
+        walk.stay(0, 300, {**HOME, "PHONE": {"name": "Galaxy S24"}, "TAG": {"manufacturer_data": FOLLOWER}})
+        walk.watcher.update(4 * 3600, [], force=True)
+        self.assertNotIn("PHONE", walk.watcher.trackers)
+        self.assertIn("TAG", walk.watcher.trackers)
 
 
 class SurveyTest(unittest.TestCase):

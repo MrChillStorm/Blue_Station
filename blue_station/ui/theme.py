@@ -142,7 +142,7 @@ def stylesheet(c: dict) -> str:
     QFrame#segments {{ background: {c['bg']}; border: 1px solid {c['border']}; border-radius: 9px; }}
     QToolButton {{ background: transparent; border: none; border-radius: 7px; padding: 5px; }}
     QToolButton:hover {{ background: {c['hover']}; }}
-    QToolButton::menu-indicator {{ image: none; width: 0; }}
+    QToolButton::menu-indicator, QPushButton::menu-indicator {{ image: none; width: 0; }}
 
     QLineEdit {{
         background: {c['surface']}; border: 1px solid {c['input_border']}; border-radius: 7px; padding: 5px 9px;

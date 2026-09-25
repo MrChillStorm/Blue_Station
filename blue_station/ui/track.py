@@ -39,12 +39,14 @@ def trend_text(slope: float | None) -> tuple[str, str]:
 class TrackPage(QWidget):
     back = Signal()
     changed = Signal(object)  # Device: nickname, pin or calibration changed
+    mineToggled = Signal(object)  # Device: yours, or watched again
     message = Signal(str)
 
     def __init__(self, read_gatt, parent=None):
         super().__init__(parent)
         self.read_gatt = read_gatt  # address -> concurrent.futures.Future of a GattResult
         self.watch_text = None  # device -> a sentence about it from the tracker watch, or None
+        self.mine_state = None  # device -> True (yours), False (watched), None (not watched)
         self.device: Device | None = None
         self._future = None
         self._ad_key = None
@@ -199,6 +201,14 @@ class TrackPage(QWidget):
         self.note.hide()
         self.note.setWordWrap(True)
         box.addWidget(self.note)
+        self.mine_btn = link_button("This is mine")
+        self.mine_btn.hide()
+        self.mine_btn.clicked.connect(lambda: self.device and self.mineToggled.emit(self.device))
+        mine_row = QHBoxLayout()
+        mine_row.setContentsMargins(0, 0, 0, 0)
+        mine_row.addWidget(self.mine_btn)
+        mine_row.addStretch(1)
+        box.addLayout(mine_row)
 
         ad = card()
         ad_box = QVBoxLayout(ad)
@@ -322,6 +332,12 @@ class TrackPage(QWidget):
         if note != self.note.text():
             self.note.setText(note)
             self.note.setVisible(bool(note))
+        mine = self.mine_state(d) if self.mine_state else None
+        self.mine_btn.setVisible(mine is not None)
+        self.mine_btn.setText("Watch it again" if mine else "This is mine")
+        self.mine_btn.setToolTip("You said it's yours. The tracker watch will look at it again." if mine else
+                                 "Your own devices go everywhere you go. Marked as yours, the tracker watch "
+                                 "leaves it alone.")
         self.read_btn.setEnabled(d.connectable is not False and self._future is None)
         if d.connectable is False and self._future is None and not self.gatt.text():
             self.gatt_status.setText("This device doesn't accept connections: it only broadcasts.")

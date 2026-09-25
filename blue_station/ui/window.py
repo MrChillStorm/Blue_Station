@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 from blue_station.core import names, prefs
 from blue_station.core.devices import Device, DeviceStore, span_text
 from blue_station.core.packets import PacketLog
-from blue_station.core.watch import FOLLOWING, Watcher
+from blue_station.core.watch import DEFAULT_GROUPS, FOLLOWING, GROUPS, Watcher
 from blue_station.ui import icons, theme
 from blue_station.ui.develop import DevelopPage
 from blue_station.ui.devices import DevicesPage
@@ -46,7 +46,8 @@ HELP = """<h3>Blue Station</h3>
 <p><b>Scan</b>: every Bluetooth Low Energy device around you, with a live signal bar each. Hover one for its
 details and last minute of signal.</p>
 <p><b>Trackers</b>: AirTags and other item trackers, and whether one is following you, meaning it has been
-with you in two different places. It watches in the background whichever job you're in.</p>
+with you in two different places. It watches in the background whichever job you're in. <b>Watch for</b> adds
+other kinds of device, and <b>This is mine</b> on a device's page leaves one of yours alone.</p>
 <p><b>Survey</b>: checks beacons (a silent one shows up as gone quiet) and maps coverage on a floor plan.
 Click where you stand and hold still for five seconds.</p>
 <p><b>Develop</b>: one device, the way its firmware's author sees it: packet timing, payload changes, a packet
@@ -85,7 +86,8 @@ class MainWindow(QMainWindow):
         self.settings = prefs.load() if settings is None else settings
         self.demo = demo
         self.store = DeviceStore(self.settings.get("known"))
-        self.watcher = Watcher(scanner.watch_history(time.time()) if demo else prefs.load(prefs.TRACKERS))
+        groups = [g for g in self.settings.get("watch_for", DEFAULT_GROUPS) if g in GROUPS] or DEFAULT_GROUPS
+        self.watcher = Watcher(scanner.watch_history(time.time()) if demo else prefs.load(prefs.TRACKERS), groups)
         self.log = PacketLog()
         self.job = SCAN
         self._watch_saved = time.time()
@@ -105,6 +107,7 @@ class MainWindow(QMainWindow):
         self.develop = DevelopPage(self.store, self.scanner.connect, self.log)
         self.track = TrackPage(self.scanner.read_gatt)
         self.track.watch_text = self._watch_text
+        self.track.mine_state = self._mine_state
         for page in (self.devices, self.trackers, self.survey, self.develop, self.track):
             self.pages.addWidget(page)
             page.message.connect(self._status)
@@ -121,6 +124,8 @@ class MainWindow(QMainWindow):
         self.track.changed.connect(self._remember)
         self.track.back.connect(self.back)
         self.trackers.changed.connect(self._save_watch)
+        self.trackers.groupsChanged.connect(self._watch_for)
+        self.track.mineToggled.connect(self._toggle_mine)
         self.views.changed.connect(self.show_job)
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda *_: self.apply_theme())
         self._shortcuts()
@@ -318,7 +323,9 @@ class MainWindow(QMainWindow):
             button.style().polish(button)
 
     def _watch_text(self, device: Device) -> str | None:
-        record = self.watcher.trackers.get(device.address)
+        if device.address in self.watcher.mine:
+            return "You said this is yours, so the tracker watch leaves it alone."
+        record = self.watcher.record(device.address)
         if record is None:
             return None
         text = f"Blue Station has heard it with you for {span_text(record.seen_seconds)}"
@@ -327,6 +334,25 @@ class MainWindow(QMainWindow):
             text = ("It may be following you. " + text + " To find it, walk around with this page open: the "
                     "signal gets stronger as you get closer.")
         return text
+
+    def _mine_state(self, device: Device) -> bool | None:
+        """True: you said it's yours. False: it's watched, and could be. None:
+        not something the watch looks at."""
+        if device.address in self.watcher.mine:
+            return True
+        return False if self.watcher.watches(device.info) else None
+
+    def _toggle_mine(self, device: Device) -> None:
+        mine = device.address not in self.watcher.mine
+        self.watcher.set_mine(device.address, mine)
+        self._save_watch()
+        self._status("Marked as yours: the tracker watch leaves it alone. A device that changes its Bluetooth "
+                     "address comes back as a new one." if mine else "The tracker watch watches it again.")
+        self.tick()
+
+    def _watch_for(self, groups: list[str]) -> None:
+        self.settings["watch_for"] = groups
+        self._save()
 
     def _save_watch(self) -> None:
         self._watch_saved = time.time()

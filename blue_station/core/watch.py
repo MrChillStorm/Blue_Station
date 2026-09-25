@@ -4,14 +4,22 @@ A tracker counts as following you once it has been with you in two
 different places. A laptop has no GPS, so places are recognized by their
 landmarks: named devices that stay put (TVs, printers, speakers, a
 fridge). When most of the landmarks around you are new, you've moved.
-Devices that come along every time (your own phone, watch, earbuds) are
-learned as companions and stop counting as landmarks. You can also say
-"I've moved" yourself.
+Named devices that come along (your phone, or anything else travelling
+with you) describe no place, so they're learned as companions and stop
+counting as landmarks. That's all it changes: they're still watched,
+because only you can say a device is yours. You can also say "I've
+moved" yourself.
 
 A tracker is only credited to a place that's settled: its landmarks are
 heard right now, or you marked it yourself. While you're between places,
 nothing is credited, so a stranger's tag at the café isn't blamed on
-your home before the café is recognized."""
+your home before the café is recognized.
+
+Item trackers are watched by default; other kinds of device can be
+added (GROUPS). Most phones, earbuds and watches change their address
+every 15 minutes or so, so only the ones with a fixed address can be
+followed from place to place. Devices you say are yours are left
+alone."""
 from dataclasses import dataclass, field
 
 FOLLOW_PLACES = 2
@@ -26,10 +34,34 @@ SETTLED_NEW = 0.25  # at most this share new, and you're still there. In between
 MATCH = 0.5  # a known place is recognized when it has this share of the landmarks around you
 CHECK_EVERY = 15
 KEEP_TRACKERS = 48 * 3600  # AirTags away from their owner change address daily
+KEEP_PASSERS_BY = 3 * 3600  # other kinds that only passed by: there are many, and most change address anyway
 KEEP_PLACES = 60 * 86400
 MAX_LANDMARKS = 200
 
 FOLLOWING, STAYING, PASSING = "following", "staying", "passing"
+
+# what the watch can look for: only things that travel
+GROUPS = {
+    "trackers": "Item trackers",
+    "headphones": "Headphones and earbuds",
+    "wearables": "Watches, bands and health devices",
+    "phones": "Phones and tablets",
+    "other": "Other devices",
+}
+DEFAULT_GROUPS = ("trackers",)
+_ICON_GROUPS = {"headphones": "headphones", "watch": "wearables", "heart": "wearables", "phone": "phones"}
+_STAY_PUT = {"tv", "speaker", "beacon"}
+
+
+def group(info) -> str | None:
+    """Which of GROUPS a device belongs to, from what its advertisement
+    says. None for things that stay put (TVs, speakers, beacons): they
+    describe places, and are never watched."""
+    if info.tracker:
+        return "trackers"
+    if info.beacon or info.icon in _STAY_PUT:
+        return None
+    return _ICON_GROUPS.get(info.icon, "other")
 
 
 @dataclass
@@ -49,6 +81,7 @@ class TrackerRecord:
     last_seen: float
     seen_seconds: float = 0.0
     places: set[int] = field(default_factory=set)
+    group: str = "trackers"
 
     @property
     def verdict(self) -> str:
@@ -58,8 +91,9 @@ class TrackerRecord:
 
 
 class Watcher:
-    def __init__(self, data: dict | None = None):
+    def __init__(self, data: dict | None = None, groups=DEFAULT_GROUPS):
         data = data or {}
+        self.groups: set[str] = set(groups)
         self.places: dict[int, Place] = {}
         for p in data.get("places", []):
             self.places[p["id"]] = Place(p["id"], p["first_seen"], p["last_seen"], set(p.get("landmarks", [])),
@@ -68,8 +102,9 @@ class Watcher:
         for t in data.get("trackers", []):
             self.trackers[t["address"]] = TrackerRecord(t["address"], t.get("kind", "Tracker"), t["first_seen"],
                                                         t["last_seen"], t.get("seen_seconds", 0.0),
-                                                        set(t.get("places", [])))
-        self.companions: set[str] = set(data.get("companions", []))
+                                                        set(t.get("places", [])), t.get("group", "trackers"))
+        self.mine: set[str] = set(data.get("mine", []))  # yours: never watched
+        self.companions: set[str] = set(data.get("companions", []))  # came along: no landmarks, still watched
         # place numbers are never reused, or a tracker's history would mix two places
         used = [0, *self.places, *(i for t in self.trackers.values() for i in t.places)]
         self.next_place = max(int(data.get("next_place", 1)), max(used) + 1)
@@ -83,8 +118,9 @@ class Watcher:
             "places": [{"id": p.id, "first_seen": p.first_seen, "last_seen": p.last_seen,
                         "landmarks": sorted(p.landmarks), "manual": p.manual} for p in self.places.values()],
             "trackers": [{"address": t.address, "kind": t.kind, "first_seen": t.first_seen, "last_seen": t.last_seen,
-                          "seen_seconds": round(t.seen_seconds, 1), "places": sorted(t.places)}
+                          "seen_seconds": round(t.seen_seconds, 1), "places": sorted(t.places), "group": t.group}
                          for t in self.trackers.values()],
+            "mine": sorted(self.mine),
             "companions": sorted(self.companions),
             "next_place": self.next_place,
         }
@@ -178,16 +214,19 @@ class Watcher:
     def _trackers(self, now: float, devices) -> list[TrackerRecord]:
         newly = []
         for d in devices:
-            if not d.info.tracker or d.age(now) > HEARD_WITHIN:
+            kind_group = group(d.info)
+            if kind_group not in self.groups or d.address in self.mine or d.age(now) > HEARD_WITHIN:
                 continue
             heard = d.last_seen
             record = self.trackers.get(d.address)
             if record is None:
-                record = self.trackers[d.address] = TrackerRecord(d.address, d.info.kind or "Tracker", heard, heard)
+                record = self.trackers[d.address] = TrackerRecord(d.address, d.info.kind or "Device", heard, heard,
+                                                                  group=kind_group)
             elif 0 < heard - record.last_seen <= GAP:
                 record.seen_seconds += heard - record.last_seen
             record.last_seen = max(record.last_seen, heard)
             record.kind = d.info.kind or record.kind
+            record.group = kind_group
             before = record.verdict
             if self.settled is not None:
                 record.places.add(self.settled.id)
@@ -196,7 +235,9 @@ class Watcher:
         return newly
 
     def _prune(self, now: float) -> None:
-        self.trackers = {a: t for a, t in self.trackers.items() if now - t.last_seen <= KEEP_TRACKERS}
+        self.trackers = {a: t for a, t in self.trackers.items()
+                         if now - t.last_seen <= (KEEP_TRACKERS if t.group == "trackers" or t.verdict != PASSING
+                                                  else KEEP_PASSERS_BY)}
         self.places = {i: p for i, p in self.places.items()
                        if now - p.last_seen <= KEEP_PLACES or p is self.current}
 
@@ -210,6 +251,7 @@ class Watcher:
         return self.current
 
     def forget(self) -> None:
+        """Forgets what it has seen. Which devices are yours stays."""
         self.places.clear()
         self.trackers.clear()
         self.companions.clear()
@@ -217,5 +259,27 @@ class Watcher:
         self.next_place = 1
         self._strikes = 0
 
+    def set_groups(self, groups) -> None:
+        """What to watch for. Records of a group turned off are kept, just
+        not shown, until they'd be forgotten anyway."""
+        self.groups = set(groups)
+
+    def set_mine(self, address: str, mine: bool = True) -> None:
+        if mine:
+            self.mine.add(address)
+            self.trackers.pop(address, None)
+        else:
+            self.mine.discard(address)
+
+    def watches(self, info) -> bool:
+        return group(info) in self.groups
+
+    def watched(self) -> list[TrackerRecord]:
+        return [t for t in self.trackers.values() if t.group in self.groups]
+
+    def record(self, address: str) -> TrackerRecord | None:
+        t = self.trackers.get(address)
+        return t if t is not None and t.group in self.groups else None
+
     def following(self) -> list[TrackerRecord]:
-        return [t for t in self.trackers.values() if t.verdict == FOLLOWING]
+        return [t for t in self.watched() if t.verdict == FOLLOWING]

@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PySide6.QtCore import QPoint, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from blue_station.core import prefs
@@ -264,6 +265,75 @@ class TrackersJobTest(WindowCase):
         self.window.watcher.forget()
         self.window.tick()
         self.assertIn("Nothing is following you", page.headline.text())
+
+    def test_watch_for_more_kinds(self):
+        self.window.show_job(TRACKERS)
+        page = self.window.trackers
+        watcher = self.window.watcher
+        band = self.device("Fitness Band")
+        tag = next(d for d in self.window.store.devices.values() if d.info.kind == "Find My device")
+        self.assertIsNone(watcher.record(band.address))
+        self.assertFalse(page.group_actions["trackers"].isEnabled())  # the last kind ticked stays ticked
+        page.group_actions["wearables"].setChecked(True)
+        self.assertEqual(prefs.load()["watch_for"], ["trackers", "wearables"])
+        self.assertTrue(page.group_actions["trackers"].isEnabled())
+        watcher.update(time.time(), list(self.window.store.devices.values()), force=True)
+        self.window.tick()
+        self.assertIn(band.address, [r.address for r in page.model.rows])
+        self.assertEqual(page.model.headerData(0, Qt.Orientation.Horizontal), "DEVICE")
+        self.assertIn("devices seen", page.detail.text())
+        self.assertIn("fixed address", page.explain.text())
+        page.group_actions["trackers"].setChecked(False)
+        self.window.tick()
+        self.assertEqual([r.address for r in page.model.rows], [band.address])
+        self.assertIn(tag.address, watcher.trackers)  # hidden, not forgotten
+        self.assertFalse(page.group_actions["wearables"].isEnabled())
+
+    def test_watch_for_menu_stays_open_while_you_tick(self):
+        page = self.window.trackers
+        menu = page.watch_menu
+        menu.popup(page.watch_btn.mapToGlobal(QPoint(0, page.watch_btn.height())))
+        for key in ("headphones", "phones"):
+            where = menu.actionGeometry(page.group_actions[key]).center()
+            QTest.mouseClick(menu, Qt.MouseButton.LeftButton, pos=where)
+            self.assertTrue(menu.isVisible())
+        menu.setActiveAction(page.group_actions["phones"])
+        QTest.keyClick(menu, Qt.Key.Key_Space)
+        self.assertTrue(menu.isVisible())
+        self.assertEqual(self.window.watcher.groups, {"trackers", "headphones"})
+        QTest.keyClick(menu, Qt.Key.Key_Escape)
+        self.assertFalse(menu.isVisible())
+
+    def test_watch_for_is_remembered(self):
+        for saved, groups in ((["phones", "no such kind"], {"phones"}), (["no such kind"], {"trackers"})):
+            window = MainWindow(DemoScanner(), {"watch_for": saved})
+            window.timer.stop()
+            self.assertEqual(window.watcher.groups, groups)
+            self.assertEqual({k for k, a in window.trackers.group_actions.items() if a.isChecked()}, groups)
+            window.close()
+            window.deleteLater()
+
+    def test_this_is_mine(self):
+        watcher = self.window.watcher
+        track = self.window.track
+        tag = next(d for d in self.window.store.devices.values() if d.info.kind == "Find My device")
+        watcher.update(time.time(), list(self.window.store.devices.values()), force=True)
+        self.window.show_device(self.device("Living Room TV"))
+        self.assertFalse(track.mine_btn.isVisibleTo(track))  # not something the watch looks at
+        self.window.show_device(tag)
+        self.assertIsNotNone(watcher.record(tag.address))
+        self.assertTrue(track.mine_btn.isVisibleTo(track))
+        self.assertEqual(track.mine_btn.text(), "This is mine")
+        track.mine_btn.click()
+        self.assertIn(tag.address, watcher.mine)
+        self.assertIsNone(watcher.record(tag.address))
+        self.assertEqual(track.mine_btn.text(), "Watch it again")
+        self.assertIn("You said this is yours", track.note.text())
+        self.assertEqual(prefs.load(prefs.TRACKERS)["mine"], [tag.address])
+        self.window.trackers.unmine()
+        self.assertEqual(watcher.mine, set())
+        self.window.tick()
+        self.assertEqual(track.mine_btn.text(), "This is mine")
 
 
 class SurveyJobTest(WindowCase):
