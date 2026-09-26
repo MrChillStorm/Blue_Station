@@ -137,6 +137,10 @@ def service_list(client) -> tuple[list[Service], dict[int, object]]:
     return services, chars
 
 
+def _why(exc: Exception) -> str:
+    return "the device didn't answer" if isinstance(exc, asyncio.TimeoutError) else str(exc) or type(exc).__name__
+
+
 class Link:
     """Its methods are called from the window's thread; the work runs on
     the scanner's asyncio loop, and results come back through drain()."""
@@ -206,21 +210,20 @@ class Link:
             raw = bytes(await asyncio.wait_for(self._client.read_gatt_char(self._chars[handle]), 10))
             self._put(handle, "read", raw)
         except Exception as exc:
-            self._put(handle, "error", text=f"Couldn't read: {str(exc) or type(exc).__name__}")
+            self._put(handle, "error", text=f"Couldn't read: {_why(exc)}")
 
     async def _notify(self, handle: int, on: bool) -> None:
         try:
             if on:
-                await self._client.start_notify(self._chars[handle],
-                                                lambda _c, data: self._put(handle, "notify", bytes(data)))
+                await asyncio.wait_for(self._client.start_notify(
+                    self._chars[handle], lambda _c, data: self._put(handle, "notify", bytes(data))), 20)
                 self.subscribed.add(handle)
             else:
                 self.subscribed.discard(handle)
                 await self._client.stop_notify(self._chars[handle])
         except Exception as exc:
             self.subscribed.discard(handle)
-            self._put(handle, "error", text=f"Couldn't {'start' if on else 'stop'} notifications: "
-                                            f"{str(exc) or type(exc).__name__}")
+            self._put(handle, "error", text=f"Couldn't {'start' if on else 'stop'} notifications: {_why(exc)}")
 
     async def _close(self) -> None:
         try:

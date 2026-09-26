@@ -3,19 +3,22 @@ devices away from their owner, Tile, SmartTag, Chipolo, Google's tags)
 and whether one is following you. Watch for adds other kinds of device.
 The watching itself runs whichever job is on screen; this page shows it."""
 import time
+from datetime import datetime
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QHeaderView, QMenu, QMessageBox, QPushButton, QStackedLayout,
+    QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderView, QInputDialog, QLineEdit, QMessageBox, QPushButton,
+    QStackedLayout,
     QStyledItemDelegate, QTableView, QVBoxLayout, QWidget,
 )
 
+from blue_station.core.decode import short_company
 from blue_station.core.devices import DeviceStore, ago_text, span_text
-from blue_station.core.watch import FOLLOWING, GROUPS, STAYING, TrackerRecord, Watcher
+from blue_station.core.watch import FOLLOWING, GROUPS, HEARD_WITHIN, STAYING, TrackerRecord, Watcher
 from blue_station.ui import icons
 from blue_station.ui.theme import colors
-from blue_station.ui.widgets import bold, card, dbm, label, link_button, paint_signal, subtitle, when
+from blue_station.ui.widgets import ChecklistMenu, bold, card, dbm, label, link_button, paint_signal, subtitle, when
 
 TRACKER, SIGNAL, WITH_YOU, PLACES, VERDICT = range(5)
 HEADERS = ["TRACKER", "SIGNAL", "WITH YOU", "PLACES", "VERDICT"]
@@ -39,25 +42,25 @@ def only_trackers(watcher: Watcher) -> bool:
     return watcher.groups == {"trackers"}
 
 
-class ChecklistMenu(QMenu):
-    """A menu whose checkboxes don't close it, so you can tick several.
-    Clicking outside or Esc closes it; other items work as usual."""
+def _clock(t: float, now: float) -> str:
+    d = datetime.fromtimestamp(t)
+    return f"{d:%H:%M}" if d.date() == datetime.fromtimestamp(now).date() else when(t)
 
-    def _tick(self, action) -> bool:
-        if action is None or not action.isCheckable():
-            return False
-        if action.isEnabled():
-            action.trigger()
-        return True
 
-    def mouseReleaseEvent(self, event) -> None:
-        if not self._tick(self.actionAt(event.position().toPoint())):
-            super().mouseReleaseEvent(event)
-
-    def keyPressEvent(self, event) -> None:
-        keys = (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space)
-        if not (event.key() in keys and self._tick(self.activeAction())):
-            super().keyPressEvent(event)
+def timeline(watcher: Watcher, record: TrackerRecord, now: float, last: int = 6) -> str:
+    """Where and when it was with you, newest last: 'Home 8:05–8:40  ·
+    unknown place 8:40–9:05  ·  Office 9:10–now'."""
+    parts = []
+    for place, start, end in record.visits[-last:]:
+        a = _clock(start, now)
+        if now - end <= HEARD_WITHIN:
+            b = "now"
+        elif datetime.fromtimestamp(end).date() == datetime.fromtimestamp(start).date():
+            b = f"{datetime.fromtimestamp(end):%H:%M}"
+        else:
+            b = when(end)
+        parts.append(f"{watcher.place_name(place)} {a if b == a else f'{a}–{b}'}")
+    return "  ·  ".join(parts)
 
 
 class TrackerModel(QAbstractTableModel):
@@ -66,6 +69,8 @@ class TrackerModel(QAbstractTableModel):
         self.watcher, self.store = watcher, store
         self.rows: list[TrackerRecord] = []
         self.now = time.time()
+        self.needle = ""
+        self.show_gone = False
 
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.rows)
@@ -94,14 +99,34 @@ class TrackerModel(QAbstractTableModel):
         record = self.rows[index.row()]
         if role == RECORD_ROLE:
             return record
+        if role == Qt.ItemDataRole.ToolTipRole and index.column() == PLACES and record.visits:
+            return timeline(self.watcher, record, self.now).replace("  ·  ", "\n")
         if role == Qt.ItemDataRole.DisplayRole:
             return [record.kind, None, span_text(record.seen_seconds), str(len(record.places)),
                     VERDICTS[record.verdict][0]][index.column()]
         return None
 
+    def around(self, record: TrackerRecord) -> bool:
+        d = self.store.devices.get(record.address)
+        return d is not None and not d.gone(self.now)
+
+    def matches(self, record: TrackerRecord) -> bool:
+        """Like the Scan page's filter, plus the verdict and where it was with you."""
+        d = self.store.devices.get(record.address)
+        words = [record.kind, record.address, VERDICTS[record.verdict][0], GROUPS.get(record.group)]
+        if d is not None:
+            words += [d.title, d.name, d.info.vendor, short_company(d.info.vendor), d.mac]
+        words += [self.watcher.place_name(v[0]) for v in record.visits]
+        haystack = " ".join(filter(None, words)).lower()
+        return all(word in haystack for word in self.needle.lower().split())
+
     def refresh(self, now: float) -> None:
         self.now = now
         order = sorted(self.watcher.watched(), key=lambda r: (_ORDER[r.verdict], -r.last_seen))
+        if not self.show_gone:  # ones that may be following you stay, like pinned devices on Scan
+            order = [r for r in order if r.verdict == FOLLOWING or self.around(r)]
+        if self.needle:
+            order = [r for r in order if self.matches(r)]
         if [r.address for r in order] != [r.address for r in self.rows]:
             self.beginResetModel()
             self.rows = order
@@ -274,13 +299,29 @@ class TrackersPage(QWidget):
         self._lock_last()
         self.watch_menu.addSeparator()
         self.unmine_action = self.watch_menu.addAction("Watch my devices again", self.unmine)
+        self.watch_menu.addAction("Forget history…", self.forget).setToolTip(
+            "Forget every tracker and place seen so far")
         self.watch_menu.aboutToShow.connect(self._menu_shown)
         self.watch_btn.setMenu(self.watch_menu)
-        self.forget_btn = link_button("Forget history", "Forget every tracker and place seen so far")
-        self.forget_btn.clicked.connect(self.forget)
+        self.search = QLineEdit()
+        self.search.setClearButtonEnabled(True)
+        self.search.setMinimumWidth(180)
+        self.search.setToolTip("Matches names, kinds, makers, addresses, verdicts and places")
+        self.search.addAction(icons.icon("search", colors()["faint"], 16), QLineEdit.ActionPosition.LeadingPosition)
+        self.search.textChanged.connect(self._filter)
+        self.name_btn = link_button("Name this place", "Call the place you're at something of your own, like Home. "
+                                                       "Timelines then say it instead of a number.")
+        self.name_btn.clicked.connect(self.name_place)
+        self.gone = QCheckBox("Show out of range")
+        self.gone.setToolTip("Also list the ones not heard for 30 seconds. Any that may be following you are "
+                             "always listed.")
+        self.gone.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.gone.toggled.connect(self._toggle_gone)
+        row.addWidget(self.search)
+        row.addWidget(self.gone)
+        row.addWidget(self.name_btn)
         row.addWidget(self.watch_btn)
         row.addWidget(self.moved_btn)
-        row.addWidget(self.forget_btn)
         layout.addWidget(status)
 
         table_card = card()
@@ -307,14 +348,16 @@ class TrackersPage(QWidget):
     def _words(self) -> None:
         """What the page calls the things it watches: trackers, or devices once
         it watches more than item trackers."""
+        self.search.setPlaceholderText(f"Filter {'trackers' if only_trackers(self.watcher) else 'devices'}   ⌘F")
         if only_trackers(self.watcher):
             self.explain.setText(EXPLAIN.format(noun="tracker"))
-            self.empty.setText("No item trackers heard yet. Blue Station keeps watching in the background, "
-                               "whichever job you're in.")
+            self._empty_text = ("No item trackers heard yet. Blue Station keeps watching in the background, "
+                                "whichever job you're in.")
         else:
             self.explain.setText(EXPLAIN.format(noun="device") + MORE)
-            self.empty.setText("Nothing you watch for heard yet. Blue Station keeps watching in the background, "
-                               "whichever job you're in.")
+            self._empty_text = ("Nothing you watch for heard yet. Blue Station keeps watching in the background, "
+                                "whichever job you're in.")
+        self.empty.setText(self._empty_text)
         self.model.headerDataChanged.emit(Qt.Orientation.Horizontal, TRACKER, TRACKER)
 
     def _menu_shown(self) -> None:
@@ -343,6 +386,25 @@ class TrackersPage(QWidget):
             self.watcher.set_mine(address, False)
         self.changed.emit()
         self.message.emit(f"Watching {count} device{'s' if count != 1 else ''} you said were yours again.")
+
+    def _toggle_gone(self, on: bool) -> None:
+        self.model.show_gone = on
+        self.tick(time.time())
+
+    def _filter(self, text: str) -> None:
+        self.model.needle = text.strip()
+        self.tick(time.time())
+
+    def name_place(self) -> None:
+        place = self.watcher.settled
+        if place is None:
+            return
+        name, ok = QInputDialog.getText(self, "Name this place", "What do you call the place you're at?",
+                                        text=place.name or "")
+        if ok:
+            self.watcher.name_place(place, name)
+            self.changed.emit()
+            self.tick(time.time())
 
     def moved(self) -> None:
         place = self.watcher.moved(time.time())
@@ -381,14 +443,27 @@ class TrackersPage(QWidget):
         watched = self.watcher.watched()
         heard = sum(1 for r in watched if (d := self.store.devices.get(r.address)) is not None and not d.gone(now))
         parts = [f"{len(watched)} {noun}{'s' if len(watched) != 1 else ''} seen, {heard} around you now"]
+        if self.model.needle:
+            parts.insert(0, f"{len(self.model.rows)} match the filter")
         settled, current = self.watcher.settled, self.watcher.current
         if settled is not None:
             marks = len(settled.landmarks)
-            parts.append(f"at place {settled.id} since {when(settled.first_seen)}"
+            parts.append(f"at {self.watcher.place_name(settled.id)} since {when(settled.first_seen)}"
                          + (f", known by {marks} landmark{'s' if marks != 1 else ''}" if marks else ", learning it"))
         elif current is not None:
             parts.append("checking whether you've moved…")
         else:
             parts.append("learning where you are (it needs two named devices that stay put)")
         self.detail.setText("  ·  ".join(parts))
+        self.name_btn.setVisible(settled is not None)
+        if settled is not None:
+            self.name_btn.setText("Rename this place" if settled.name else "Name this place")
+        away = len(watched) - heard
+        if self.model.needle:
+            self.empty.setText(f"No {noun} matches the filter.")
+        elif away and not self.model.show_gone:
+            self.empty.setText(f"No {noun}s around you now. Tick Show out of range to see the {away} heard "
+                               "earlier.")
+        else:
+            self.empty.setText(self._empty_text)
         self.stack.setCurrentWidget(self.table if self.model.rows else self.empty)

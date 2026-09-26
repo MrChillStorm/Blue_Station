@@ -6,8 +6,8 @@ import time
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderView, QLineEdit, QStackedLayout, QStyle, QStyledItemDelegate,
-    QTableView, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderView, QLineEdit, QSlider, QStackedLayout, QStyle,
+    QStyledItemDelegate, QTableView, QVBoxLayout, QWidget,
 )
 
 from blue_station.core.decode import short_company
@@ -29,6 +29,11 @@ def matches(device: Device, needle: str) -> bool:
     return all(word in haystack.lower() for word in needle.lower().split())
 
 
+NEAR = -80  # dBm: by default, Nearby only shows devices at least this strong...
+NEAR_SLACK = 4  # ... and keeps them until this much weaker, so a device on the edge doesn't flicker
+NEAR_RANGE = (-100, -40)
+
+
 class DeviceModel(QAbstractTableModel):
     def __init__(self, store: DeviceStore, parent=None):
         super().__init__(parent)
@@ -37,6 +42,9 @@ class DeviceModel(QAbstractTableModel):
         self.now = time.time()
         self.needle = ""
         self.show_gone = False
+        self.nearby_only = False
+        self.near_dbm = NEAR
+        self._near: set[str] = set()
         self.sort_column, self.sort_order = SIGNAL, Qt.SortOrder.DescendingOrder
         self.frozen = False
         self.predicate = None  # a job's own rule for which devices belong in its list
@@ -99,9 +107,20 @@ class DeviceModel(QAbstractTableModel):
             return device.age(self.now)
         return -999.0 if device.smoothed is None else device.smoothed  # PIN and SIGNAL
 
+    def near(self, device: Device) -> bool:
+        s = device.smoothed
+        near = s is not None and (s >= self.near_dbm or (device.address in self._near
+                                                          and s >= self.near_dbm - NEAR_SLACK))
+        if near:
+            self._near.add(device.address)
+        else:
+            self._near.discard(device.address)
+        return near
+
     def visible(self) -> list[Device]:
         return [d for d in self.store.devices.values()
                 if (d.pinned or self.show_gone or not d.gone(self.now)) and (not self.needle or matches(d, self.needle))
+                and (d.pinned or not self.nearby_only or self.near(d))
                 and (self.predicate is None or self.predicate(d))]
 
     def refresh(self, now: float, force: bool = False) -> None:
@@ -427,9 +446,26 @@ class DevicesPage(QWidget):
         self.search.setPlaceholderText("Filter devices   ⌘F")
         self.search.setToolTip("Matches names, kinds, makers and addresses")
         self.search.setClearButtonEnabled(True)
-        self.search.setMinimumWidth(280)
+        self.search.setMinimumWidth(220)
         self.search.addAction(icons.icon("search", colors()["faint"], 16), QLineEdit.ActionPosition.LeadingPosition)
         self.search.textChanged.connect(self._filter)
+        self.nearby = QCheckBox("Nearby only")
+        self.nearby.setToolTip("Hide devices weaker than the signal set beside it. Pinned devices stay.")
+        self.nearby.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.nearby.toggled.connect(self._toggle_nearby)
+        self.near_slider = QSlider(Qt.Orientation.Horizontal)
+        self.near_slider.setRange(*NEAR_RANGE)
+        self.near_slider.setPageStep(5)
+        self.near_slider.setValue(NEAR)
+        self.near_slider.setFixedWidth(96)
+        self.near_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.near_slider.setToolTip("How strong a device has to be to count as nearby. Roughly: −60 dBm is close "
+                                    "by in the same room, −80 the next room, −90 and weaker far away.")
+        self.near_slider.valueChanged.connect(self._set_near)
+        self.near_value = label(f"{dbm(NEAR)} dBm", "muted")
+        self.near_value.setFixedWidth(self.near_value.fontMetrics().horizontalAdvance(f"{dbm(-100)} dBm") + 4)
+        self.near_slider.setEnabled(False)
+        self.near_value.setEnabled(False)
         self.gone = QCheckBox("Show out of range")
         self.gone.setToolTip("Also list devices that haven't been heard for 30 seconds")
         self.gone.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -437,6 +473,10 @@ class DevicesPage(QWidget):
         self.clear_btn = link_button("Clear", "Forget the devices heard so far (pinned ones stay)")
         self.clear_btn.clicked.connect(self.clear)
         row.addWidget(self.search)
+        row.addWidget(self.nearby)
+        row.addSpacing(-6)
+        row.addWidget(self.near_slider)
+        row.addWidget(self.near_value)
         row.addWidget(self.gone)
         row.addWidget(self.clear_btn)
         return frame
@@ -449,6 +489,18 @@ class DevicesPage(QWidget):
 
     def _toggle_gone(self, on: bool) -> None:
         self.model.show_gone = on
+        self.model.refresh(time.time(), force=True)
+
+    def _toggle_nearby(self, on: bool) -> None:
+        self.model.nearby_only = on
+        self.near_slider.setEnabled(on)
+        self.near_value.setEnabled(on)
+        self.model.refresh(time.time(), force=True)
+
+    def _set_near(self, value: int) -> None:
+        self.model.near_dbm = value
+        self.model._near.clear()  # the slack is for flicker at one setting, not across settings
+        self.near_value.setText(f"{dbm(value)} dBm")
         self.model.refresh(time.time(), force=True)
 
     def clear(self) -> None:
@@ -486,6 +538,9 @@ class DevicesPage(QWidget):
         pinned = sum(1 for d in devices if d.pinned)
         if pinned:
             parts.append(f"{pinned} pinned")
+        far = sum(1 for d in in_range if not d.pinned and not self.model.near(d)) if self.model.nearby_only else 0
+        if far:
+            parts.append(f"{far} weaker than {dbm(self.model.near_dbm)} dBm hidden")
         if len(self.model.rows) != len(in_range) and self.model.needle:
             parts.insert(0, f"{len(self.model.rows)} match the filter")
         self.detail.setText("  ·  ".join(parts) or "Nothing heard yet")
@@ -497,6 +552,9 @@ class DevicesPage(QWidget):
                 text = error
             elif self.model.needle:
                 text = "No device matches the filter."
+            elif far:
+                text = (f"Nothing at {dbm(self.model.near_dbm)} dBm or stronger. Move the slider left, or turn off "
+                        f"Nearby only, to see the {far} weaker ones.")
             elif state == "starting":
                 text = "Starting the scan…  If macOS asks whether Blue Station may use Bluetooth, allow it."
             elif state == "scanning":

@@ -2,7 +2,8 @@
 menu; one timer that feeds the scanner's packets to everything that
 wants them. Each job is its own page; a device's own page opens from any
 of them and goes back to where it came from. The tracker watch runs
-whichever job is on screen."""
+whichever job is on screen, and with the menu bar on, it keeps running
+after the window is closed."""
 import csv
 import json
 import subprocess
@@ -11,23 +12,25 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, Qt, QTimer
+from PySide6.QtCore import QByteArray, QEvent, Qt, QTimer
 from PySide6.QtGui import QActionGroup, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton,
-    QStackedWidget, QStatusBar, QVBoxLayout, QWidget,
+    QStackedWidget, QStatusBar, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from blue_station.core import names, prefs
+from blue_station.core import login, names, prefs
+from blue_station.core.alerts import GONE, Alerts
 from blue_station.core.devices import Device, DeviceStore, span_text
 from blue_station.core.packets import PacketLog
 from blue_station.core.watch import DEFAULT_GROUPS, FOLLOWING, GROUPS, Watcher
 from blue_station.ui import icons, theme
 from blue_station.ui.develop import DevelopPage
 from blue_station.ui.devices import DevicesPage
+from blue_station.ui.menubar import MenuBar
 from blue_station.ui.survey import SurveyPage
 from blue_station.ui.track import TrackPage
-from blue_station.ui.trackers import TrackersPage
+from blue_station.ui.trackers import TrackersPage, timeline
 from blue_station.ui.widgets import ScanIndicator, Segmented, refresh_tool_icons, tool_button
 
 SCAN, TRACKERS, SURVEY, DEVELOP = range(4)
@@ -53,7 +56,9 @@ Click where you stand and hold still for five seconds.</p>
 <p><b>Develop</b>: one device, the way its firmware's author sees it: packet timing, payload changes, a packet
 log that records only when you press Record, and a GATT explorer with live notifications.</p>
 <p>Click a device in any job for its own page: a big live signal with its trend (walk toward something you've
-lost), rough distance, history and the decoded advertisement.</p>
+lost), rough distance, history and the decoded advertisement. Its <b>speaker</b> beeps faster as you get closer,
+and its <b>bell</b> tells you when it goes out of range or comes back.</p>
+<p>Closing the window leaves Blue Station watching in the menu bar. Quit from its menu there, or with ⌘Q.</p>
 <p>Distances are rough. Many phones change their Bluetooth address every few minutes for privacy, so one phone
 can show up as several devices over time.</p>
 <table cellpadding='2'>
@@ -89,6 +94,10 @@ class MainWindow(QMainWindow):
         groups = [g for g in self.settings.get("watch_for", DEFAULT_GROUPS) if g in GROUPS] or DEFAULT_GROUPS
         self.watcher = Watcher(scanner.watch_history(time.time()) if demo else prefs.load(prefs.TRACKERS), groups)
         self.log = PacketLog()
+        self.alerts = Alerts()
+        self.menubar: MenuBar | None = None
+        self._quitting = False
+        self._hidden_at: float | None = None  # when it was closed to the menu bar
         self.job = SCAN
         self._watch_saved = time.time()
         self.resize(1320, 840)
@@ -131,6 +140,9 @@ class MainWindow(QMainWindow):
         self._shortcuts()
 
         self.devices.gone.setChecked(bool(self.settings.get("show_gone")))
+        self.devices.near_slider.setValue(int(self.settings.get("nearby_dbm", self.devices.near_slider.value())))
+        self.devices.nearby.setChecked(bool(self.settings.get("nearby_only")))
+        self.trackers.gone.setChecked(bool(self.settings.get("trackers_show_gone")))
         geometry = self.settings.get("geometry")
         if geometry:
             self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
@@ -141,6 +153,7 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start()
         self.scanner.start()
+        self._set_menu_bar(bool(self.settings.get("menu_bar", True)))
         self.tick()
 
     def _build_header(self) -> QFrame:
@@ -192,6 +205,21 @@ class MainWindow(QMainWindow):
             group.addAction(action)
             self.appearance_actions[key] = action
         menu.addSeparator()
+        self.menu_bar_action = menu.addAction("Keep watching in the menu bar")
+        self.menu_bar_action.setCheckable(True)
+        self.menu_bar_action.setChecked(bool(self.settings.get("menu_bar", True)))
+        self.menu_bar_action.setToolTip("Closing the window leaves Blue Station in the menu bar, still watching for "
+                                        "trackers and your alerts")
+        self.menu_bar_action.toggled.connect(self._menu_bar_toggled)
+        self.login_action = None
+        if login.supported():
+            self.login_action = menu.addAction("Start at login")
+            self.login_action.setCheckable(True)
+            self.login_action.setChecked(login.enabled())
+            self.login_action.setToolTip("Start Blue Station in the menu bar when you log in")
+            self.login_action.toggled.connect(self.set_start_at_login)
+        menu.setToolTipsVisible(True)
+        menu.addSeparator()
         menu.addAction("Export device list…", self.export_devices_dialog)
         menu.addAction("Clear list", lambda: self.devices.clear())
         menu.addSeparator()
@@ -228,6 +256,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Blue Station – {JOBS[job]}")
         if job == SCAN:
             self.devices.table.setFocus()
+        elif job == TRACKERS:
+            self.centralWidget().setFocus()  # not the filter: Space should still pause
         self.tick()
 
     def show_device(self, device: Device) -> None:
@@ -240,6 +270,11 @@ class MainWindow(QMainWindow):
         self.show_job(self.job)
 
     def focus_search(self) -> None:
+        if self.job == TRACKERS:
+            self.show_job(TRACKERS)
+            self.trackers.search.setFocus()
+            self.trackers.search.selectAll()
+            return
         if self.job == DEVELOP:
             self.show_job(DEVELOP)
             self.develop.search.setFocus()
@@ -256,6 +291,8 @@ class MainWindow(QMainWindow):
         elif self.on_page(self.devices) and self.devices.search.text():
             self.devices.search.clear()
             self.devices.table.setFocus()
+        elif self.on_page(self.trackers) and self.trackers.search.text():
+            self.trackers.search.clear()
 
     # ---- scanning and the timer ---------------------------------------------------------
 
@@ -275,11 +312,15 @@ class MainWindow(QMainWindow):
         devices = list(self.store.devices.values())
         for record in self.watcher.update(now, devices):
             self._alert(record)
+        for device, what in self.alerts.update(now, devices, self.scanner.state == "scanning"):
+            self._device_alert(device, what)
         if not self.demo and now - self._watch_saved >= SAVE_WATCH_EVERY:
             self._save_watch()
         if self.survey.survey.update(now, devices):
             self._status(f"Point {len(self.survey.survey.points)} added.")
         self._follow_badge()
+        if self.menubar is not None:
+            self.menubar.show_state(len(self.watcher.following()), self.scanner.state)
 
         state, error = self.scanner.state, self.scanner.error
         text = {"scanning": "Scanning", "starting": "Starting…", "error": "Not scanning"}.get(state, "Paused")
@@ -312,6 +353,14 @@ class MainWindow(QMainWindow):
             notify("Blue Station", text)
         self._save_watch()
 
+    def _device_alert(self, device: Device, what: str) -> None:
+        """One you asked for on the device's page: out of range, or back."""
+        text = (f"{device.title} is out of range. Did you leave it behind?" if what == GONE
+                else f"{device.title} is back in range.")
+        self._status(text)
+        if QGuiApplication.platformName() != "offscreen":
+            notify("Blue Station", text)
+
     def _follow_badge(self) -> None:
         count = len(self.watcher.following())
         button = self.views.button(TRACKERS)
@@ -333,6 +382,8 @@ class MainWindow(QMainWindow):
         if record.verdict == FOLLOWING:
             text = ("It may be following you. " + text + " To find it, walk around with this page open: the "
                     "signal gets stronger as you get closer.")
+        if record.visits:
+            text += "\n\nWith you: " + timeline(self.watcher, record, time.time())
         return text
 
     def _mine_state(self, device: Device) -> bool | None:
@@ -433,22 +484,140 @@ class MainWindow(QMainWindow):
         refresh_tool_icons(self.menu_btn)
         for page in (self.track, self.survey, self.develop):
             page.refresh_icons()
-        self.devices.search.actions()[0].setIcon(icons.icon("search", theme.colors()["faint"], 16))
+        for search in (self.devices.search, self.trackers.search):
+            search.actions()[0].setIcon(icons.icon("search", theme.colors()["faint"], 16))
         for view in (self.devices.table, self.trackers.table, self.survey.table, self.develop.table):
             view.viewport().update()
         self.indicator.update()
 
-    def closeEvent(self, event) -> None:
-        self.timer.stop()
+    # ---- the menu bar -------------------------------------------------------------------
+
+    def _set_menu_bar(self, on: bool) -> None:
+        on = on and QSystemTrayIcon.isSystemTrayAvailable()
+        if on and self.menubar is None:
+            self.menubar = MenuBar(self)
+            self.menubar.set_login(login.supported() and login.enabled())
+            self.menubar.show()
+        elif not on and self.menubar is not None:
+            self.menubar.hide()
+            self.menubar.deleteLater()
+            self.menubar = None
+            if not self.isVisible():
+                self.bring_back()
+
+    def _menu_bar_toggled(self, on: bool) -> None:
+        self.settings["menu_bar"] = on
+        self._save()
+        self._set_menu_bar(on)
+        if on and self.menubar is None:
+            self._status("This system has no menu bar or tray for Blue Station: closing the window quits.")
+
+    def set_start_at_login(self, on: bool) -> None:
+        try:
+            login.enable() if on else login.disable()
+        except OSError as exc:
+            self._status(f"Couldn't change starting at login: {exc}")
+        on = login.enabled()
+        if self.login_action is not None:
+            self.login_action.blockSignals(True)
+            self.login_action.setChecked(on)
+            self.login_action.blockSignals(False)
+        if self.menubar is not None:
+            self.menubar.set_login(on)
+        where = ", in the menu bar" if self.menubar is not None else ""
+        self._status(f"Blue Station starts when you log in{where}. The first time, macOS may ask about Bluetooth "
+                     "again." if on else "Blue Station no longer starts when you log in.")
+
+    def hide_to_menu_bar(self, tell: bool = True) -> None:
+        """The window goes; the watching stays."""
         for page in (self.devices, self.survey, self.develop):
             page.hover.hide()
-        self.develop.disconnect()
+        self.develop.disconnect()  # no need to keep a device connected for nobody
+        if self.isVisible():  # started at login, it never was: keep the window's last size and place
+            self._keep_settings()
+        self.hide()
+        self._hidden_at = time.time()
+        self._step_aside(True)
+        if tell and not self.settings.get("menu_bar_told"):
+            self.settings["menu_bar_told"] = True
+            self._save()
+            if QGuiApplication.platformName() != "offscreen":
+                notify("Blue Station", "Still watching in the menu bar. Quit from its menu there.")
+
+    def bring_back(self) -> None:
+        self._hidden_at = None
+        self._step_aside(False)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.tick()
+
+    def quit_app(self) -> None:
+        self._quitting = True
+        self.close()
+        QApplication.instance().quit()
+
+    def _step_aside(self, hidden: bool) -> None:
+        """macOS: closed to the menu bar, the app hides like ⌘H, so clicking it
+        in the Dock (or opening it again) brings the window back. Its Dock
+        icon stays: taking the app out of the Dock at runtime lost the menu
+        bar icon too."""
+        if sys.platform != "darwin" or QGuiApplication.platformName() != "cocoa":
+            return
+        try:
+            from AppKit import NSApplication
+            app = NSApplication.sharedApplication()
+            if hidden:
+                app.hide_(None)
+            else:
+                app.unhide_(None)
+                app.activateIgnoringOtherApps_(True)
+        except Exception:
+            pass
+
+    def watch_app(self, app: QApplication) -> None:
+        """Called once by the app: to tell quitting from closing, and to
+        notice being opened again."""
+        app.installEventFilter(self)
+        app.applicationStateChanged.connect(self._app_state)
+
+    def _app_state(self, state) -> None:
+        """Clicking Blue Station in the Dock (or opening it again) while it's in
+        the menu bar brings the window back."""
+        if (state == Qt.ApplicationState.ApplicationActive and self._hidden_at is not None
+                and time.time() - self._hidden_at > 1 and not self._quitting):
+            self.bring_back()
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Type.Quit:  # ⌘Q, logging out: really quit, not just hide
+            self._quitting = True
+        return False
+
+    # ---- closing --------------------------------------------------------------------------
+
+    def _keep_settings(self) -> None:
         self.settings["geometry"] = bytes(self.saveGeometry().toBase64()).decode()
         self.settings["show_gone"] = self.devices.gone.isChecked()
+        self.settings["nearby_only"] = self.devices.nearby.isChecked()
+        self.settings["nearby_dbm"] = self.devices.near_slider.value()
+        self.settings["trackers_show_gone"] = self.trackers.gone.isChecked()
         self.settings["job"] = self.job
         if not self.demo:
             self.settings["known"] = self.store.known
         self._save()
         self._save_watch()
+
+    def closeEvent(self, event) -> None:
+        if self.menubar is not None and not self._quitting:
+            event.ignore()
+            self.hide_to_menu_bar()
+            return
+        self.timer.stop()
+        for page in (self.devices, self.survey, self.develop):
+            page.hover.hide()
+        self.develop.disconnect()
+        self._keep_settings()
         self.scanner.close()
+        if self.menubar is not None:
+            self.menubar.hide()
         event.accept()

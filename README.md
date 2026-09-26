@@ -14,14 +14,15 @@ at the top and you get only what that job needs:
   notifications.
 
 Clicking a device in any job opens its own page. There you can track it,
-which helps you find something you've lost.
+which helps you find something you've lost, and ask to be told when it
+gets left behind. Closing the window leaves Blue Station watching from
+the menu bar.
 
 ![Scan: the device list with live signal bars, and the hover card over one device with its last minute of signal](docs/devices.png)
 
 *The screenshots show the made-up devices of `blue-station --demo`.*
 
 Built with Python, PySide6 (Qt) and [bleak](https://github.com/hbldh/bleak).
-It never writes to a device, and nothing leaves your computer.
 
 ## Install & run
 
@@ -69,6 +70,27 @@ Blue Station is built and used on macOS. bleak also works on Windows and
 Linux, and the app is plain Qt, so it should run there too (⌘ means
 Ctrl), but only macOS has been tried.
 
+## In the menu bar
+
+Closing the window doesn't quit. Blue Station keeps watching for
+trackers and for your alerts behind a small icon in the menu bar (the
+app icon's rounded square with the waves cut out). A red badge on the
+icon counts the devices that may be following you. Clicking Blue
+Station in the Dock opens the window again.
+When the menu bar is full, or on a display with a notch, macOS hides
+the icons that don't fit. Its menu opens the window again, pauses scanning, and
+quits, and so does ⌘Q. Starting Blue Station again while it's there
+brings the window back. **Keep watching in the menu bar** in the gear
+menu turns this off.
+
+**Start at login**, in either menu, starts Blue Station in the menu bar
+when you log in (macOS). It adds a LaunchAgent
+(`~/Library/LaunchAgents/io.github.mrchillstorm.bluestation.plist`) and
+a small app next to your settings, which runs the same Python and Blue
+Station you turned it on from. After moving either, turn it off and on
+again. macOS lists it under System Settings → General → Login Items, and
+may ask about Bluetooth once more the first time.
+
 ## Scan
 
 Everything heard in the last 30 seconds, strongest first.
@@ -85,6 +107,10 @@ Everything heard in the last 30 seconds, strongest first.
   flickering.
 - **A rough distance**, and when a packet was last heard. Devices that
   go quiet fade out. **Show out of range** keeps them listed.
+- **Nearby only** hides devices weaker than the signal set on the
+  slider beside it, for busy places: roughly −60 dBm is close by in the
+  same room, −80 (where it starts) the next room, and −90 and weaker
+  far away. Pinned devices stay.
 
 **Hover** a device for its card: the last minute of signal as a
 sparkline, packets per second, the address, services and anything
@@ -106,6 +132,14 @@ top, and Blue Station remembers it.
 - **The advertisement**, raw and decoded.
 - **Connect and read** fetches the standard information: name, maker,
   model, serial number, firmware and battery.
+- **The speaker button** beeps while you search: faster, and a little
+  higher, as the signal gets stronger. Walk towards the faster beeps and
+  look at the room instead of the screen.
+- **The bell** sends a notification when the device goes out of range
+  (did you leave your bag behind?) or comes back in range. Only
+  scanning counts: pausing, Bluetooth going off or the Mac sleeping
+  isn't the device leaving, and one on the edge of range alerts at most
+  every 5 minutes.
 - The **pencil** gives it a name of your own, and **Export** saves its
   signal log as CSV.
 
@@ -134,10 +168,23 @@ neighbour's tag) or **Following you**.
 - While you're between places, nothing is credited to a place. So a
   stranger's tag at a café can't be blamed on your home before the café
   is recognized.
-- **It watches in the background**, whichever job is on screen, and
-  remembers what it has seen across restarts: trackers for 48 hours
-  (AirTags away from their owner keep their address for a day), places
-  for 60 days.
+- **Out of range** trackers (not heard for 30 seconds) are left out,
+  unless they may be following you. **Show out of range** lists them
+  all.
+- **The filter** (⌘F) finds trackers by name, kind, maker or address,
+  like the Scan page's, and also by verdict and by the places they were
+  with you.
+- **It watches in the background**, whichever job is on screen and
+  from the menu bar after you close the window. It remembers what it
+  has seen across restarts: trackers for 48 hours (AirTags away from
+  their owner keep their address for a day), places for 60 days, and
+  places you've named for good.
+- **Name this place** calls the place you're at *Home* or *Office*
+  instead of a number. A device's own page then shows where and when it
+  was with you, like *Home 8:05–8:40 · unknown place 8:40–9:05 · Office
+  9:10–now*, and pointing at its number of places shows the same.
+  *Unknown place* is time with you before a place was recognized, or on
+  the way between places.
 - **Watch for** adds other kinds of device: headphones and earbuds,
   watches, bands and health devices, phones and tablets, or anything
   else that could travel. TVs, speakers and beacons stay put, so they're
@@ -228,19 +275,20 @@ Pick a device on the left.
 | ⌘E | Export what's on screen |
 
 The gear menu has the appearance (dark by default, light, or following
-the system), **Export device list…**, **Clear list** and help.
+the system), **Keep watching in the menu bar**, **Start at login**,
+**Export device list…**, **Clear list** and help.
 
 ## Your data
 
 Nothing is recorded unless you export it, except two small files kept in
 your system's usual place for app data:
 
-- `settings.json`: settings, and the names, pins and calibrations you
-  give devices.
+- `settings.json`: settings, and the names, pins, calibrations and
+  alerts you give devices.
 - `trackers.json`: the tracker watch's memory, meaning which trackers
-  it has seen, which devices you said are yours, and the landmarks of
-  your places (the per-Mac IDs of named devices). Nothing else about
-  where you are. **Forget history** on the Trackers page empties it,
+  it has seen and when, which devices you said are yours, and your
+  places: their landmarks (the per-Mac IDs of named devices) and the
+  names you give them. Nothing else about where you are. **Forget history…** in the Trackers page's Watch for menu empties it,
   except for which devices are yours.
 
 | System | Folder |
@@ -264,12 +312,15 @@ python3 packaging/build_icon.py      # rebuild the app icon after editing packag
   - `scanner.py`: bleak on a background thread, and the demo
   - `devices.py`: each device's history, smoothing, statistics, distance, trend and packet gaps
   - `decode.py`: what an advertisement says (kinds, makers, beacons, Apple, Microsoft...)
-  - `watch.py`: trackers, places and landmarks
+  - `watch.py`: trackers, places and landmarks, and each device's timeline
+  - `alerts.py`: out of range and back again, for the devices you asked about
   - `survey.py`: survey points and the map's estimate
   - `packets.py`: the packet log
   - `gatt.py`: the quick read, and the lasting connection with notifications
   - `names.py`: Bluetooth SIG names for companies, services and characteristics
   - `prefs.py`: the settings files
+  - `login.py`: starting at login on macOS
 - `blue_station/ui/` is the PySide6 interface:
   - `devices.py` (Scan), `trackers.py`, `survey.py`, `develop.py` and `track.py` (a device's own page)
-  - `window.py`, `widgets.py`, `theme.py` and `icons.py`: everything around them
+  - `window.py`, `menubar.py`, `widgets.py`, `theme.py` and `icons.py`: everything around them
+  - `sound.py`: the beep for finding a device

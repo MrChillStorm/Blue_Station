@@ -130,6 +130,28 @@ class DevicesTest(WindowCase):
         self.assertEqual(subtitle(store.devices["S2"]), "No name advertised")
         self.assertEqual(subtitle(store.devices["S3"]), "Computer  ·  Apple")
 
+    def test_nearby_only(self):
+        page = self.window.devices
+        weak = self.device("Bike Sensor")  # about -87 dBm
+        pinned = self.device("Thermo Sensor 3A")
+        page.table.pinToggled.emit(pinned)
+        page.nearby.setChecked(True)
+        self.window.tick()
+        shown = page.model.rows
+        self.assertNotIn(weak, shown)
+        self.assertIn(pinned, shown)  # pinned ones stay
+        self.assertTrue(all(d.pinned or d.smoothed >= -84 for d in shown))
+        self.assertIn("weaker than −80 dBm hidden", page.detail.text())
+        before = len(shown)
+        page.near_slider.setValue(-55)  # stricter: fewer count as nearby
+        self.window.tick()
+        self.assertEqual(page.near_value.text(), "−55 dBm")
+        self.assertLess(len(page.model.rows), before)
+        self.assertTrue(all(d.pinned or d.smoothed >= -59 for d in page.model.rows))
+        self.window.close()
+        self.assertTrue(prefs.load()["nearby_only"])
+        self.assertEqual(prefs.load()["nearby_dbm"], -55)
+
     def test_hover_card(self):
         page = self.window.devices
         device = page.model.rows[0]
@@ -179,6 +201,36 @@ class TrackTest(WindowCase):
         self.window.show_device(tag)
         self.assertTrue(self.window.track.note.isVisibleTo(self.window.track))
         self.assertIn("travelling with you", self.window.track.note.text())
+
+    def test_beeping_while_you_search(self):
+        from PySide6.QtTest import QTest
+        from blue_station.ui.sound import FASTEST, SLOWEST, interval
+        self.assertEqual(interval(-120), SLOWEST)
+        self.assertAlmostEqual(interval(-30), FASTEST)
+        self.assertGreater(interval(-80), interval(-60))
+        self.open("Fitness Band")
+        track = self.window.track
+        track.sound.click()
+        self.assertTrue(track.beeper.on)
+        QTest.qWait(700)
+        self.assertGreater(track.beeper.beeps, 0)
+        self.window.back()  # leaving the page stops it
+        self.assertFalse(track.beeper.on)
+
+    def test_alerts(self):
+        from blue_station.core.alerts import BACK, GONE
+        device = self.open("Desk Keyboard")
+        track = self.window.track
+        track.alert_gone.trigger()
+        self.assertTrue(device.alert_gone)
+        self.assertFalse(device.alert_back)
+        self.assertEqual(prefs.load()["known"][device.address], {"alert_gone": True})
+        self.window._device_alert(device, GONE)
+        self.assertIn("Desk Keyboard is out of range", self.window.statusBar().currentMessage())
+        self.window._device_alert(device, BACK)
+        self.assertIn("back in range", self.window.statusBar().currentMessage())
+        self.window.devices.clear()
+        self.assertIn(device.address, self.window.store.devices)  # kept, or it would seem to arrive again
 
     def test_rename_calibrate_and_remember(self):
         device = self.open("Desk Keyboard")
@@ -265,6 +317,74 @@ class TrackersJobTest(WindowCase):
         self.window.watcher.forget()
         self.window.tick()
         self.assertIn("Nothing is following you", page.headline.text())
+
+    def test_filter(self):
+        self.window.show_job(TRACKERS)
+        page = self.window.trackers
+        self.window.watcher.update(time.time(), list(self.window.store.devices.values()), force=True)
+        self.window.tick()
+        everything = len(page.model.rows)
+        self.assertGreaterEqual(everything, 2)  # the demo's Find My tag and Tile
+        self.window.focus_search()
+        self.assertEqual(self.window.job, TRACKERS)  # ⌘F stays on this page
+        page.search.setText("tile")
+        self.window.tick()
+        self.assertEqual([r.kind for r in page.model.rows], ["Tile tracker"])
+        self.assertIn("1 match the filter", page.detail.text())
+        page.search.setText("passing")  # verdicts match too
+        self.window.tick()
+        self.assertTrue(page.model.rows and all(r.verdict == "passing" for r in page.model.rows))
+        page.search.setText("nothing like this")
+        self.window.tick()
+        self.assertIs(page.stack.currentWidget(), page.empty)
+        self.assertEqual(page.empty.text(), "No tracker matches the filter.")
+        self.window.escape()
+        self.assertEqual(page.search.text(), "")
+        self.assertEqual(len(page.model.rows), everything)
+
+    def test_out_of_range_ones_wait_behind_a_checkbox(self):
+        from blue_station.core.watch import TrackerRecord
+        self.window.show_job(TRACKERS)
+        page = self.window.trackers
+        watcher = self.window.watcher
+        now = time.time()
+        watcher.trackers["GONE-TAG"] = TrackerRecord("GONE-TAG", "Tile tracker", now - 3600, now - 600)
+        watcher.trackers["GONE-FOLLOWER"] = TrackerRecord("GONE-FOLLOWER", "Find My device", now - 3600, now - 600,
+                                                          places={1, 2})
+        self.window.tick()
+        shown = [r.address for r in page.model.rows]
+        self.assertNotIn("GONE-TAG", shown)
+        self.assertIn("GONE-FOLLOWER", shown)  # following you: always listed
+        page.gone.setChecked(True)
+        self.assertIn("GONE-TAG", [r.address for r in page.model.rows])
+        page.gone.setChecked(False)
+        del watcher.trackers["GONE-FOLLOWER"]
+        for address in [a for a in watcher.trackers if a != "GONE-TAG"]:
+            del watcher.trackers[address]
+        self.window.tick()
+        self.assertIn("Tick Show out of range to see the 1 heard earlier", page.empty.text())
+        self.window.close()
+        self.assertFalse(prefs.load()["trackers_show_gone"])
+
+    def test_naming_a_place_and_the_timeline(self):
+        from unittest import mock
+        self.window.show_job(TRACKERS)
+        page = self.window.trackers
+        watcher = self.window.watcher
+        tag = next(d for d in self.window.store.devices.values() if d.info.kind == "Find My device")
+        watcher.moved(time.time())
+        watcher.update(time.time(), list(self.window.store.devices.values()), force=True)
+        self.window.tick()
+        self.assertTrue(page.name_btn.isVisibleTo(page))
+        with mock.patch("blue_station.ui.trackers.QInputDialog.getText", return_value=("Office", True)):
+            page.name_btn.click()
+        self.assertIn("at Office since", page.detail.text())
+        self.assertEqual(page.name_btn.text(), "Rename this place")
+        self.window.show_device(tag)
+        self.assertIn("Office", self.window.track.note.text())
+        self.assertIn("now", self.window.track.note.text())
+        saved = prefs.load(prefs.TRACKERS)
+        self.assertIn("Office", [p.get("name") for p in saved["places"]])
 
     def test_watch_for_more_kinds(self):
         self.window.show_job(TRACKERS)
@@ -433,6 +553,50 @@ class DevelopJobTest(WindowCase):
         page.toggle_connection()
         self.assertIsNone(page.link)
 
+    def connected(self):
+        page = self.page
+        page.toggle_connection()
+        deadline = time.time() + 3
+        while not page._items and time.time() < deadline:
+            time.sleep(0.1)
+            self.window.tick()
+        return page
+
+    def test_follow_button_says_what_the_device_answered(self):
+        from blue_station.core import gatt
+        page = self.connected()
+        follow = page._follows[15]  # the heart rate measurement
+        follow.click()
+        self.assertEqual(follow.text(), "Stop")
+        page._waiting[15] = time.time() - 30  # followed, and quiet ever since
+        page.link._last[15] = time.time() + 60  # the demo strap sends nothing for a while
+        self.window.tick()
+        self.assertIn("heart rate sharing", page.gatt_status.text())
+        follow.click()
+        self.assertEqual(follow.text(), "Follow")
+
+        battery = page._follows[21]
+        page.link.notify = lambda h, on: page.link._queue.append(
+            gatt.Event(h, time.time(), "error", "Couldn't start notifications: Encryption is insufficient."))
+        battery.click()
+        self.assertEqual(battery.text(), "Follow")  # refused: it doesn't pretend
+        self.assertTrue(battery.isEnabled())
+        self.assertIn("Encryption is insufficient", page.notes.toPlainText())
+
+    def test_the_device_hanging_up(self):
+        page = self.connected()
+        follow = page._follows[15]
+        follow.click()
+        link = page.link
+        link.state, link.error = "closed", "The device disconnected."
+        link.subscribed.clear()
+        self.window.tick()
+        self.assertEqual(follow.text(), "Follow")
+        self.assertFalse(follow.isEnabled())
+        self.assertTrue(all(not b.isEnabled() for b in page._buttons))
+        self.assertIn("The device disconnected.", page.notes.toPlainText())
+        self.assertEqual(page.connect_btn.text(), "Connect")
+
     def test_switching_device_disconnects(self):
         page = self.page
         page.toggle_connection()
@@ -440,6 +604,56 @@ class DevelopJobTest(WindowCase):
         page.table.pick(self.device("Desk Keyboard"))
         self.assertIsNone(page.link)
         self.assertEqual(link.state, "closed")
+
+
+class MenuBarTest(WindowCase):
+    def setUp(self):
+        super().setUp()
+        from blue_station.ui.menubar import MenuBar
+        self.window.menubar = MenuBar(self.window)  # offscreen has no menu bar to show it in
+        self.window.show()
+
+    def tearDown(self):
+        self.window._quitting = True
+        super().tearDown()
+
+    def test_closing_leaves_it_watching(self):
+        self.window.close()
+        self.assertFalse(self.window.isVisible())
+        self.assertEqual(self.scanner.state, "scanning")
+        self.assertTrue(prefs.load()["menu_bar_told"])
+        self.window.bring_back()
+        self.assertTrue(self.window.isVisible())
+
+    def test_what_it_shows(self):
+        bar = self.window.menubar
+        bar.show_state(2, "scanning")
+        self.assertEqual(bar.status.text(), "2 devices may be following you")
+        self.assertFalse(bar.icon().isMask())  # the red badge keeps its color
+        bar.show_state(0, "idle")
+        self.assertIn("paused", bar.status.text())
+        self.assertEqual(bar.scan_action.text(), "Scan")
+        self.assertTrue(bar.icon().isMask())
+
+    def test_quitting_really_quits(self):
+        from PySide6.QtCore import QEvent
+        self.window.eventFilter(None, QEvent(QEvent.Type.Quit))  # ⌘Q
+        self.window.close()
+        self.assertEqual(self.scanner.state, "idle")
+
+    def test_starting_again_brings_the_window_back(self):
+        from PySide6.QtTest import QTest
+        from blue_station.app import already_running, listen
+        name = f"blue-station-test-{os.getpid()}"
+        server = listen(name, self.window)
+        self.window.close()
+        self.assertFalse(already_running(name + "-other", show=True))
+        self.assertTrue(already_running(name, show=True))
+        deadline = time.time() + 3
+        while not self.window.isVisible() and time.time() < deadline:
+            QTest.qWait(50)
+        self.assertTrue(self.window.isVisible())
+        server.close()
 
 
 class ThemeTest(WindowCase):

@@ -12,7 +12,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from blue_station.core import gatt
+from blue_station.core import gatt, login
+from blue_station.core.alerts import BACK, GONE, Alerts
 from blue_station.core.devices import Device, DeviceStore, Sighting, gap_stats
 from blue_station.core.packets import PacketLog
 from blue_station.core.scanner import Scanner
@@ -110,6 +111,37 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(again.next_place, walk.watcher.next_place)
         self.assertIsNone(again.current)  # where you are is worked out again, not assumed
 
+    def test_timeline_and_named_places(self):
+        walk = Walk()
+        follower = {"TAG": {"manufacturer_data": FOLLOWER}}
+        walk.stay(0, 900, {**HOME, **follower})
+        home = walk.watcher.settled
+        walk.watcher.name_place(home, "  Home ")
+        walk.stay(900, 1500, follower)
+        walk.stay(1500, 2400, {**CAFE, **follower})
+        visits = walk.watcher.trackers["TAG"].visits
+        self.assertEqual([walk.watcher.place_name(v[0]) for v in visits],  # home takes a few minutes to recognize
+                         ["unknown place", "Home", "unknown place", f"place {walk.watcher.settled.id}"])
+        self.assertTrue(all(a[2] <= b[1] for a, b in zip(visits, visits[1:])))  # in order, no overlaps
+        again = Watcher(walk.watcher.to_dict())
+        self.assertEqual(again.places[home.id].name, "Home")
+        self.assertEqual(again.trackers["TAG"].visits, visits)
+        again._prune(home.last_seen + 90 * 86400)
+        self.assertIn(home.id, again.places)  # named: kept for good
+        walk.watcher.name_place(home, " ")
+        self.assertIsNone(home.name)
+
+    def test_a_marked_place_that_turns_out_known_keeps_its_name(self):
+        walk = Walk()
+        walk.stay(0, 900, {**HOME, "TAG": {"manufacturer_data": FOLLOWER}})
+        home = walk.watcher.settled
+        marked = walk.watcher.moved(900)  # pressed by mistake...
+        walk.watcher.name_place(marked, "Home")  # ... and named straight away
+        walk.stay(900, 1200, {**HOME, "TAG": {"manufacturer_data": FOLLOWER}})
+        self.assertEqual(walk.watcher.settled.id, home.id)
+        self.assertEqual(home.name, "Home")
+        self.assertNotIn(marked.id, [v[0] for v in walk.watcher.trackers["TAG"].visits])
+
     def test_place_numbers_are_never_reused(self):
         watcher = Watcher({"trackers": [{"address": "T", "kind": "Tile tracker", "first_seen": 0, "last_seen": 0,
                                          "places": [7]}]})
@@ -178,6 +210,76 @@ class WatchForTest(unittest.TestCase):
         walk.watcher.update(4 * 3600, [], force=True)
         self.assertNotIn("PHONE", walk.watcher.trackers)
         self.assertIn("TAG", walk.watcher.trackers)
+
+
+class AlertsTest(unittest.TestCase):
+    def setUp(self):
+        self.store = DeviceStore({"BAG": {"alert_gone": True, "alert_back": True}})
+        self.alerts = Alerts()
+
+    def seconds(self, start: int, end: int, heard: list[str], scanning: bool = True) -> list[tuple[str, str]]:
+        due = []
+        for t in range(start, end):
+            if scanning:
+                self.store.ingest([Sighting(a, -60, t) for a in heard])
+            due += [(d.address, what) for d, what in self.alerts.update(t, list(self.store.devices.values()),
+                                                                          scanning)]
+        return due
+
+    def test_left_behind_and_back(self):
+        self.assertEqual(self.seconds(0, 60, ["BAG", "TV"]), [])
+        self.assertEqual(self.seconds(60, 120, ["TV"]), [("BAG", GONE)])  # quiet for 30 s: gone
+        self.assertEqual(self.seconds(120, 130, ["BAG", "TV"]), [("BAG", BACK)])
+
+    def test_only_devices_with_alerts(self):
+        self.seconds(0, 60, ["BAG", "TV"])
+        self.assertEqual(self.seconds(60, 120, ["BAG"]), [])  # the TV left, but nobody asked about it
+
+    def test_arriving_after_the_room_is_heard(self):
+        self.assertEqual(self.seconds(0, 40, ["TV"]), [])
+        self.assertEqual(self.seconds(40, 45, ["TV", "BAG"]), [("BAG", BACK)])
+
+    def test_starting_up_isnt_arriving(self):
+        self.assertEqual(self.seconds(0, 60, ["BAG"]), [])
+
+    def test_pausing_or_sleeping_isnt_leaving(self):
+        self.seconds(0, 60, ["BAG"])
+        self.assertEqual(self.seconds(60, 200, [], scanning=False), [])
+        self.assertEqual(self.seconds(200, 260, []), [])  # scanning again, and it's not around: no news
+        self.seconds(260, 300, ["BAG"])
+        self.assertEqual(self.seconds(1000, 1060, []), [])  # asleep from 300 to 1000
+
+    def test_one_on_the_edge_of_range_doesnt_nag(self):
+        self.seconds(0, 60, ["BAG"])
+        due = self.seconds(60, 100, []) + self.seconds(100, 110, ["BAG"]) + self.seconds(110, 150, [])
+        self.assertEqual(due, [("BAG", GONE), ("BAG", BACK)])  # the second GONE waits out the cooldown
+
+
+class LoginTest(unittest.TestCase):
+    def test_starting_at_login(self):
+        import os
+        import plistlib
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)  # never the real ~/Library
+            self.assertFalse(login.enabled(home))
+            login.enable(home, python=sys.executable)
+            self.assertTrue(login.enabled(home))
+            bundle = login.bundle_path(home)
+            job = plistlib.loads(login.agent_path(home).read_bytes())
+            self.assertEqual(job["ProgramArguments"], ["/usr/bin/open", "-g", "-a", str(bundle), "--args",
+                                                       "--background"])
+            self.assertTrue(job["RunAtLoad"])
+            info = plistlib.loads((bundle / "Contents" / "Info.plist").read_bytes())
+            self.assertIn("Bluetooth", info["NSBluetoothAlwaysUsageDescription"])
+            script = bundle / "Contents" / "MacOS" / info["CFBundleExecutable"]
+            self.assertTrue(os.access(script, os.X_OK))
+            run = subprocess.run([str(script), "--help"], capture_output=True, text=True, cwd=tmp, timeout=60)
+            self.assertEqual(run.returncode, 0, run.stderr)  # it finds this Python and this Blue Station
+            self.assertIn("--background", run.stdout)
+            login.disable(home)
+            self.assertFalse(login.enabled(home))
+            self.assertFalse(bundle.exists())
 
 
 class SurveyTest(unittest.TestCase):

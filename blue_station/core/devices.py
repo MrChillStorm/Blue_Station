@@ -125,6 +125,8 @@ class Device:
         self.nickname: str | None = None
         self.pinned = False
         self.calibration: int | None = None  # the signal measured at 1 m
+        self.alert_gone = False  # a notification when it goes out of range...
+        self.alert_back = False  # ... and when it comes back
 
     # ---- taking in packets -------------------------------------------------------
 
@@ -280,7 +282,7 @@ def gap_stats(gaps: list[float]) -> GapStats | None:
 
 class DeviceStore:
     """All devices seen this session, plus what's remembered about some of
-    them between sessions (nickname, pinned, calibration)."""
+    them between sessions (nickname, pinned, calibration, alerts)."""
 
     def __init__(self, known: dict | None = None):
         self.devices: dict[str, Device] = {}
@@ -297,12 +299,15 @@ class DeviceStore:
                 device.nickname = prefs.get("nickname")
                 device.pinned = bool(prefs.get("pinned"))
                 device.calibration = prefs.get("calibration")
+                device.alert_gone = bool(prefs.get("alert_gone"))
+                device.alert_back = bool(prefs.get("alert_back"))
                 new += 1
             device.update(s)
         return new
 
     def remember(self, device: Device) -> None:
-        prefs = {"nickname": device.nickname, "pinned": device.pinned or None, "calibration": device.calibration}
+        prefs = {"nickname": device.nickname, "pinned": device.pinned or None, "calibration": device.calibration,
+                 "alert_gone": device.alert_gone or None, "alert_back": device.alert_back or None}
         prefs = {k: v for k, v in prefs.items() if v is not None}
         if prefs:
             self.known[device.address] = prefs
@@ -310,5 +315,6 @@ class DeviceStore:
             self.known.pop(device.address, None)
 
     def clear(self) -> None:
-        """Forgets this session's devices, except pinned ones."""
-        self.devices = {a: d for a, d in self.devices.items() if d.pinned}
+        """Forgets this session's devices, except pinned ones and ones with
+        alerts (or they'd seem to arrive when heard again)."""
+        self.devices = {a: d for a, d in self.devices.items() if d.pinned or d.alert_gone or d.alert_back}

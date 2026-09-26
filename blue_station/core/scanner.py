@@ -230,14 +230,16 @@ class DemoScanner:
 
     def watch_history(self, now: float) -> dict:
         """A made-up past for the tracker watch: the demo's Find My tag was
-        already with you somewhere else this morning."""
+        already with you at home this morning, and on the way here."""
         named = [a for a, spec in zip(self._addresses, _DEMO) if spec[0]]
         return {
-            "places": [{"id": 1, "first_seen": now - 4 * 3600, "last_seen": now - 2 * 3600,
+            "places": [{"id": 1, "first_seen": now - 4 * 3600, "last_seen": now - 2 * 3600, "name": "Home",
                         "landmarks": ["DEMO-HOME-TV", "DEMO-HOME-PRINTER", "DEMO-HOME-SPEAKER"]},
                        {"id": 2, "first_seen": now - 40 * 60, "last_seen": now, "landmarks": named, "manual": True}],
             "trackers": [{"address": self._addresses[4], "kind": "Find My device", "first_seen": now - 3.5 * 3600,
-                          "last_seen": now - 2.1 * 3600, "seen_seconds": 52 * 60, "places": [1]}],
+                          "last_seen": now - 2.62 * 3600, "seen_seconds": 52 * 60, "places": [1],
+                          "visits": [[1, now - 3.5 * 3600, now - 2.75 * 3600],  # at home, then on the way
+                                     [None, now - 2.75 * 3600, now - 2.62 * 3600]]}],
             "current": 2,
         }
 

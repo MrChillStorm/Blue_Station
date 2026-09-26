@@ -8,7 +8,7 @@ from datetime import datetime
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QFrame, QHBoxLayout, QLabel, QPushButton, QToolButton, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QToolButton, QVBoxLayout, QWidget,
 )
 
 from blue_station.core.decode import hex_bytes, short_company
@@ -78,6 +78,27 @@ def refresh_tool_icons(*buttons: QToolButton, color_key: str = "muted") -> None:
     c = colors()
     for b in buttons:
         b.setIcon(icons.icon(b.property("icon_name"), c[color_key], b.iconSize().width()))
+
+
+class ChecklistMenu(QMenu):
+    """A menu whose checkboxes don't close it, so you can tick several.
+    Clicking outside or Esc closes it; other items work as usual."""
+
+    def _tick(self, action) -> bool:
+        if action is None or not action.isCheckable():
+            return False
+        if action.isEnabled():
+            action.trigger()
+        return True
+
+    def mouseReleaseEvent(self, event) -> None:
+        if not self._tick(self.actionAt(event.position().toPoint())):
+            super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        keys = (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space)
+        if not (event.key() in keys and self._tick(self.activeAction())):
+            super().keyPressEvent(event)
 
 
 def card() -> QFrame:

@@ -1,7 +1,9 @@
 """The tracking page: one device, everything about it. A big live signal
-with its trend (for walking toward something you've lost), rough
-distance, statistics, the signal's history, the decoded advertisement,
-and what the device says about itself when asked (GATT)."""
+with its trend (for walking toward something you've lost, with a beep
+that speeds up as you get closer), rough distance, statistics, the
+signal's history, the decoded advertisement, alerts for when it goes out
+of range or comes back, and what the device says about itself when asked
+(GATT)."""
 import csv
 import time
 from datetime import datetime
@@ -9,16 +11,18 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QFileDialog, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QFileDialog, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from blue_station.core import names
 from blue_station.core.devices import Device, ago_text, distance_text, duration_text, quality
 from blue_station.ui import icons
+from blue_station.ui.sound import Beeper
 from blue_station.ui.theme import colors, signal_color
 from blue_station.ui.widgets import (
-    RssiChart, Segmented, SignalMeter, StatTile, advertisement_rows, card, dbm, esc, kv_html, label, link_button,
-    refresh_tool_icons, subtitle, tool_button,
+    ChecklistMenu, RssiChart, Segmented, SignalMeter, StatTile, advertisement_rows, card, dbm, esc, kv_html, label,
+    link_button, refresh_tool_icons, subtitle, tool_button,
 )
 
 WINDOWS = [60, 300, 900]
@@ -38,7 +42,7 @@ def trend_text(slope: float | None) -> tuple[str, str]:
 
 class TrackPage(QWidget):
     back = Signal()
-    changed = Signal(object)  # Device: nickname, pin or calibration changed
+    changed = Signal(object)  # Device: nickname, pin, calibration or alerts changed
     mineToggled = Signal(object)  # Device: yours, or watched again
     message = Signal(str)
 
@@ -96,6 +100,20 @@ class TrackPage(QWidget):
         self.sub = label("", "muted")
         heads.addLayout(title_row)
         heads.addWidget(self.sub)
+        self.beeper = Beeper(self)
+        self.sound = tool_button("sound", "Beep while you search: faster as the signal gets stronger. Walk towards "
+                                          "the faster beeps.", 20)
+        self.sound.clicked.connect(self._toggle_sound)
+        self.bell = tool_button("bell", "Alerts: a notification when it goes out of range or comes back", 20)
+        self.bell.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        alerts = ChecklistMenu(self)
+        self.alert_gone = alerts.addAction("When it goes out of range")
+        self.alert_gone.setToolTip("Did you leave it behind? Not heard for 30 seconds while scanning")
+        self.alert_back = alerts.addAction("When it comes back in range")
+        for action in (self.alert_gone, self.alert_back):
+            action.setCheckable(True)
+            action.triggered.connect(self._alerts_picked)
+        self.bell.setMenu(alerts)
         self.star = tool_button("star", "Pin: keep it on top of the list and remember it", 20)
         self.star.clicked.connect(self._toggle_pin)
         self.export_btn = tool_button("export", "Export this device's signal log as CSV (⌘E)", 18)
@@ -104,6 +122,8 @@ class TrackPage(QWidget):
         row.addSpacing(6)
         row.addWidget(self.icon)
         row.addLayout(heads, 1)
+        row.addWidget(self.sound)
+        row.addWidget(self.bell)
         row.addWidget(self.star)
         row.addWidget(self.export_btn)
         return frame
@@ -266,6 +286,7 @@ class TrackPage(QWidget):
     def show_device(self, device: Device) -> None:
         if device is not self.device:
             self.device = device
+            self.beeper.set_on(False)  # a new device starts quiet
             self._future = None
             self._ad_key = None
             self.gatt.clear()
@@ -290,6 +311,11 @@ class TrackPage(QWidget):
         self.sub.setText(f"{subtitle(d)}  ·  {d.mac or d.address}")
         self.star.setProperty("icon_name", "star_filled" if d.pinned else "star")
         refresh_tool_icons(self.star, color_key="accent" if d.pinned else "muted")
+        refresh_tool_icons(self.sound, color_key="accent" if self.beeper.on else "muted")
+        refresh_tool_icons(self.bell, color_key="accent" if d.alert_gone or d.alert_back else "muted")
+        self.alert_gone.setChecked(d.alert_gone)
+        self.alert_back.setChecked(d.alert_back)
+        self.beeper.update(None if d.gone(now) else d.smoothed)
 
         gone = d.gone(now)
         color = c["faint"] if gone else signal_color(d.smoothed, c)
@@ -344,6 +370,22 @@ class TrackPage(QWidget):
         self._check_gatt()
 
     # ---- actions --------------------------------------------------------------------
+
+    def _toggle_sound(self) -> None:
+        self.beeper.set_on(not self.beeper.on)
+        self.message.emit("Beeping: faster as the signal gets stronger." if self.beeper.on else "Beeping off.")
+        self.tick(time.time())
+
+    def _alerts_picked(self) -> None:
+        if self.device:
+            self.device.alert_gone = self.alert_gone.isChecked()
+            self.device.alert_back = self.alert_back.isChecked()
+            self.changed.emit(self.device)
+            self.tick(time.time())
+
+    def hideEvent(self, event) -> None:
+        self.beeper.set_on(False)  # leaving the page (or hiding the window) stops the beeping
+        super().hideEvent(event)
 
     def _toggle_pin(self) -> None:
         if self.device:

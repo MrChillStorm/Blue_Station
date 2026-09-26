@@ -25,6 +25,7 @@ from blue_station.ui.widgets import StatTile, card, esc, label, link_button, sub
 
 SHOWN = 300  # packets the log table shows; the rest wait in the log for export
 GAP_BINS = 30  # 10 ms to 10 s, ten bins a decade
+QUIET = 10  # followed this long with nothing sent: say so
 
 
 def mono():
@@ -153,6 +154,11 @@ class DevelopPage(QWidget):
         self.device: Device | None = None
         self.link = None
         self._items: dict[int, QTreeWidgetItem] = {}
+        self._buttons: list[QPushButton] = []  # every Read and Follow: only while connected
+        self._follows: dict[int, QPushButton] = {}
+        self._pending: dict[int, bool] = {}  # handle -> following asked on or off, not yet answered
+        self._waiting: dict[int, float] = {}  # handle -> when following started, until its first value
+        self._link_state = None
         self._payload_key = None
         self._shown_total = -1
         layout = QHBoxLayout(self)
@@ -419,22 +425,29 @@ class DevelopPage(QWidget):
         if self.link is not None and self.link.state in (gatt.CONNECTING, gatt.CONNECTED):
             self.disconnect()
         elif self.device is not None:
-            self.tree.clear()
-            self._items.clear()
+            self._clear_tree()
             self.link = self.connect_to(self.device.address)
+            self._link_state = None
         self.tick(time.time())
 
     def disconnect(self) -> None:
         if self.link is not None:
             self.link.close()
         self.link = None
+        self._clear_tree()
+
+    def _clear_tree(self) -> None:
         self.tree.clear()
-        self._items.clear()
+        for table in (self._items, self._follows, self._pending, self._waiting):
+            table.clear()
+        self._buttons.clear()
+
+    def _note(self, t: float, text: str) -> None:
+        self.notes.appendPlainText(f"{datetime.fromtimestamp(t).strftime('%H:%M:%S.%f')[:-3]}  {text}")
 
     def _build_tree(self) -> None:
         c = colors()
-        self.tree.clear()
-        self._items.clear()
+        self._clear_tree()
         for service in self.link.services:
             top = QTreeWidgetItem([f"{service.name}   {names.pretty_uuid(service.uuid)}", "", ""])
             top.setForeground(0, QColor(c["ink"]))
@@ -458,18 +471,24 @@ class DevelopPage(QWidget):
                     read = link_button("Read", "Read its value now")
                     read.clicked.connect(lambda _=False, h=char.handle: self.link.read(h))
                     row.addWidget(read)
+                    self._buttons.append(read)
                 if char.notifies:
                     follow = link_button("Follow", "Follow its notifications live")
-                    follow.setCheckable(True)
-                    follow.toggled.connect(lambda on, h=char.handle, b=follow: self._follow(h, on, b))
+                    follow.clicked.connect(lambda _=False, h=char.handle: self._follow(h))
                     row.addWidget(follow)
+                    self._buttons.append(follow)
+                    self._follows[char.handle] = follow
                 row.addStretch(1)
                 self.tree.setItemWidget(item, 2, actions)
             top.setExpanded(True)
 
-    def _follow(self, handle: int, on: bool, button: QPushButton) -> None:
-        button.setText("Stop" if on else "Follow")
+    def _follow(self, handle: int) -> None:
+        """Asks to start or stop. The button says what the device answered,
+        not what was asked."""
+        on = handle not in self.link.subscribed
+        self._pending[handle] = on
         self.link.notify(handle, on)
+        self._gatt_tick()
 
     def _gatt_tick(self) -> None:
         link = self.link
@@ -489,15 +508,46 @@ class DevelopPage(QWidget):
             item.setText(1, event.text)
             item.setToolTip(1, event.text + raw)
             if event.kind == "notify":
-                stamp = datetime.fromtimestamp(event.t).strftime("%H:%M:%S.%f")[:-3]
-                self.notes.appendPlainText(f"{stamp}  {item.text(0)}  {event.text}{raw}")
+                self._waiting.pop(event.handle, None)
+                self._note(event.t, f"{item.text(0)}  {event.text}{raw}")
             elif event.kind == "error":
+                self._pending.pop(event.handle, None)
+                self._note(event.t, f"{item.text(0)}  {event.text}")  # it stays where it's looked for
                 self.message.emit(event.text)
         state = link.state
         if state == gatt.CONNECTED and not self._items and link.services:
             self._build_tree()
+        if state != self._link_state:
+            if state == gatt.CLOSED and self._link_state == gatt.CONNECTED and link.error:
+                self._note(time.time(), link.error)  # the device hung up, rather than you
+            self._link_state = state
+        connected = state == gatt.CONNECTED
+        for handle, on in list(self._pending.items()):
+            if not connected or (handle in link.subscribed) == on:
+                del self._pending[handle]
+                if connected and on:
+                    self._waiting[handle] = time.time()
+        if not connected:
+            self._waiting.clear()
+        for button in self._buttons:
+            button.setEnabled(connected)
+        for handle, button in self._follows.items():
+            button.setText("Stop" if connected and handle in link.subscribed else "Follow")
+            if handle in self._pending:
+                button.setEnabled(False)  # until the device answers
         text = {gatt.CONNECTING: "Connecting…", gatt.CONNECTED: f"Connected: {len(link.services)} services.",
                 gatt.CLOSED: link.error or "Disconnected.", gatt.FAILED: f"Couldn't connect: {link.error}"}[state]
+        quiet = [h for h, t in self._waiting.items() if h in link.subscribed and time.time() - t >= QUIET]
+        starting = [h for h, on in self._pending.items() if on]
+        if connected and starting:
+            text += f" Starting to follow {self._items[starting[0]].text(0)}…"
+        elif connected and quiet:
+            short = next((names.short_uuid(c.uuid) for s in link.services for c in s.characteristics
+                          if c.handle == quiet[0]), None)
+            text += (" Following Heart Rate Measurement: nothing yet. A watch usually sends its heart rate only "
+                     "after you turn on heart rate sharing on the watch." if short == 0x2A37 else
+                     f" Following {self._items[quiet[0]].text(0)}: nothing yet. A device sends only when it has "
+                     "a new value.")
         self.gatt_status.setText(text)
         live = state in (gatt.CONNECTING, gatt.CONNECTED)
         self.connect_btn.setText("Disconnect" if live else "Connect")

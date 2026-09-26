@@ -35,7 +35,8 @@ MATCH = 0.5  # a known place is recognized when it has this share of the landmar
 CHECK_EVERY = 15
 KEEP_TRACKERS = 48 * 3600  # AirTags away from their owner change address daily
 KEEP_PASSERS_BY = 3 * 3600  # other kinds that only passed by: there are many, and most change address anyway
-KEEP_PLACES = 60 * 86400
+KEEP_PLACES = 60 * 86400  # places you've named are kept for good
+MAX_VISITS = 100  # a device's timeline: this many stretches with you, newest last
 MAX_LANDMARKS = 200
 
 FOLLOWING, STAYING, PASSING = "following", "staying", "passing"
@@ -71,6 +72,7 @@ class Place:
     last_seen: float
     landmarks: set[str] = field(default_factory=set)
     manual: bool = False  # marked by you: settled until its landmarks say otherwise
+    name: str | None = None  # yours to give: 'Home', 'Office'
 
 
 @dataclass
@@ -82,6 +84,16 @@ class TrackerRecord:
     seen_seconds: float = 0.0
     places: set[int] = field(default_factory=set)
     group: str = "trackers"
+    # stretches it was heard with you: [place id, or None while no place is recognized, from, to]
+    visits: list[list] = field(default_factory=list)
+
+    def visit(self, place: int | None, t: float) -> None:
+        last = self.visits[-1] if self.visits else None
+        if last is not None and last[0] == place and 0 <= t - last[2] <= GAP:
+            last[2] = t
+        elif last is None or t > last[2]:
+            self.visits.append([place, t, t])
+            del self.visits[:-MAX_VISITS]
 
     @property
     def verdict(self) -> str:
@@ -97,12 +109,13 @@ class Watcher:
         self.places: dict[int, Place] = {}
         for p in data.get("places", []):
             self.places[p["id"]] = Place(p["id"], p["first_seen"], p["last_seen"], set(p.get("landmarks", [])),
-                                         bool(p.get("manual")))
+                                         bool(p.get("manual")), p.get("name"))
         self.trackers: dict[str, TrackerRecord] = {}
         for t in data.get("trackers", []):
             self.trackers[t["address"]] = TrackerRecord(t["address"], t.get("kind", "Tracker"), t["first_seen"],
                                                         t["last_seen"], t.get("seen_seconds", 0.0),
-                                                        set(t.get("places", [])), t.get("group", "trackers"))
+                                                        set(t.get("places", [])), t.get("group", "trackers"),
+                                                        [list(v) for v in t.get("visits", [])])
         self.mine: set[str] = set(data.get("mine", []))  # yours: never watched
         self.companions: set[str] = set(data.get("companions", []))  # came along: no landmarks, still watched
         # place numbers are never reused, or a tracker's history would mix two places
@@ -116,9 +129,11 @@ class Watcher:
     def to_dict(self) -> dict:
         return {
             "places": [{"id": p.id, "first_seen": p.first_seen, "last_seen": p.last_seen,
-                        "landmarks": sorted(p.landmarks), "manual": p.manual} for p in self.places.values()],
+                        "landmarks": sorted(p.landmarks), "manual": p.manual, "name": p.name}
+                       for p in self.places.values()],
             "trackers": [{"address": t.address, "kind": t.kind, "first_seen": t.first_seen, "last_seen": t.last_seen,
-                          "seen_seconds": round(t.seen_seconds, 1), "places": sorted(t.places), "group": t.group}
+                          "seen_seconds": round(t.seen_seconds, 1), "places": sorted(t.places), "group": t.group,
+                          "visits": t.visits}
                          for t in self.trackers.values()],
             "mine": sorted(self.mine),
             "companions": sorted(self.companions),
@@ -164,6 +179,10 @@ class Watcher:
                     if current.id in record.places:
                         record.places.discard(current.id)
                         record.places.add(known.id)
+                    for v in record.visits:
+                        if v[0] == current.id:
+                            v[0] = known.id
+                known.name = known.name or current.name
                 del self.places[current.id]
                 current = self.current = known
         new = len(marks - current.landmarks) / len(marks)
@@ -230,6 +249,7 @@ class Watcher:
             before = record.verdict
             if self.settled is not None:
                 record.places.add(self.settled.id)
+            record.visit(self.settled.id if self.settled is not None else None, heard)
             if record.verdict == FOLLOWING and before != FOLLOWING:
                 newly.append(record)
         return newly
@@ -239,7 +259,7 @@ class Watcher:
                          if now - t.last_seen <= (KEEP_TRACKERS if t.group == "trackers" or t.verdict != PASSING
                                                   else KEEP_PASSERS_BY)}
         self.places = {i: p for i, p in self.places.items()
-                       if now - p.last_seen <= KEEP_PLACES or p is self.current}
+                       if now - p.last_seen <= KEEP_PLACES or p is self.current or p.name}
 
     # ---- asked for -----------------------------------------------------------------------
 
@@ -258,6 +278,15 @@ class Watcher:
         self.current = self.settled = None
         self.next_place = 1
         self._strikes = 0
+
+    def name_place(self, place: Place, name: str) -> None:
+        place.name = name.strip() or None
+
+    def place_name(self, place_id: int | None) -> str:
+        if place_id is None:
+            return "unknown place"
+        place = self.places.get(place_id)
+        return place.name if place is not None and place.name else f"place {place_id}"
 
     def set_groups(self, groups) -> None:
         """What to watch for. Records of a group turned off are kept, just
