@@ -20,6 +20,11 @@ class Alerts:
         self._here: dict[str, bool] = {}  # every listed device: in range at the last tick?
         self._alerted: dict[tuple[str, str], float] = {}
 
+    def hand_over(self, old: str, new: str) -> None:
+        """The new address is a device that was here all along: not an arrival."""
+        self._here[new] = True
+        self._here.pop(old, None)
+
     def update(self, now: float, devices, scanning: bool) -> list[tuple[object, str]]:
         """Returns (device, GONE or BACK) for each alert due."""
         if not scanning or (self._tick is not None and now - self._tick > GAP):
@@ -33,6 +38,8 @@ class Alerts:
         settled = now - self.since >= SETTLE
         due, here = [], {}
         for d in devices:
+            if d.superseded_by is not None:  # it changed its address, it didn't leave
+                continue
             here[d.address] = now_here = not d.gone(now)
             was = self._here.get(d.address, False)  # first heard just now: it arrived
             if not settled or was == now_here:

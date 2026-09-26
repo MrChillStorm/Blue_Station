@@ -39,12 +39,13 @@ blue-station
 
 `pipx upgrade blue-station` gets each new release. To install one
 particular version instead, add its tag to the end, like
-`Blue_Station.git@v1.3.0`. pipx then keeps that version, and
+`Blue_Station.git@v1.4.0`. pipx then keeps that version, and
 `pipx upgrade` won't move it.
 
 `blue-station --demo` fills the room with made-up devices, a made-up
-morning for the tracker watch, and a heart rate strap to connect to. Use
-it to try every job without Bluetooth.
+morning for the tracker watch, a heart rate strap to connect to, and an
+iPad that changes its address after 100 seconds. Use it to try every
+job without Bluetooth.
 
 **From a clone**, which is also what `Blue Station.app` uses:
 
@@ -108,19 +109,44 @@ Everything heard in the last 30 seconds, strongest first.
   flickering.
 - **A rough distance**, and when a packet was last heard. Devices that
   go quiet fade out. **Show out of range** keeps them listed.
-- **Nearby only** hides devices weaker than the signal set on the
-  slider beside it, for busy places: roughly −60 dBm is close by in the
-  same room, −80 (where it starts) the next room, and −90 and weaker
-  far away. Pinned devices stay.
+- **One device, even when its address changes.** Phones, AirPods,
+  watches and other Apple devices change their Bluetooth address every
+  15 minutes or so. When Blue Station hears it happen (the old address
+  goes quiet, and within seconds a new one starts from the same spot
+  with the same kind of advertisement), the device carries on under its
+  new address: one row, with its history, name, pin and alerts. Its card
+  and page say how many times it changed, and how sure Blue Station is;
+  70–95 % is usual. Signal strength says how far a device is, not which
+  one it is, so two identical devices changing at the same moment are
+  left apart rather than guessed.
+- **It learns as it goes**, from the changes it's sure of. First, which
+  bytes of each kind of advertisement stay the same through a change:
+  an AirPlay target, for one, keeps its network address in it. A device
+  with enough such bytes is recognized even after a change nobody heard,
+  out of range or while the Mac slept. It starts using them after the
+  first change it's sure of, tentatively, and fully after the second:
+  once, a random byte may have stayed the same by chance. Kinds that
+  change every byte, like most phones' and Find My's, still start over
+  as a new device then. Second, which devices change together: an Apple
+  TV, say, sends two kinds of advertisement that change at the same
+  moments. Those are listed as one device, the other kind carried along
+  with it. A device's card shows both.
+- **Nearby only** lists only devices whose signal is within the range
+  on the two-handle slider beside it, for busy places. The left handle
+  is the weakest shown: roughly −60 dBm is close by in the same room,
+  −80 (where it starts) the next room, and −90 and weaker far away.
+  Pulled in from the top, the right handle also hides the strongest,
+  like your own devices right next to you. Pinned devices stay.
 - **New only** takes a baseline: everything heard so far counts as
   known, and the list shows only devices that turn up after that, like
   something just brought into the room. Its **bell** sends a
   notification with a sound for each one, even from the menu bar, and
-  with Nearby only on, only for the near ones. **Reset** takes a fresh
-  baseline. Phones, AirPods and watches change their address every 15
-  minutes or so and then look new, unless they advertise a name that's
-  already known, so it works best for a short watch or for devices that
-  keep their address.
+  with Nearby only on, only for the ones within its range. **Reset**
+  takes a fresh baseline. Phones, AirPods and watches change their
+  address every 15 minutes or so. One whose change Blue Station heard,
+  or that advertises a name already known, stays known; the others come
+  back looking new, so it works best for a short watch or for devices
+  that keep their address.
 
 **The filter** (⌘F) matches names, kinds, makers and addresses. A
 minus in front of a word leaves out what matches: `-apple -tv` hides
@@ -146,7 +172,8 @@ top, and Blue Station remembers it.
   Point at the chart to read any packet.
 - **The advertisement**, raw and decoded.
 - **Connect and read** fetches the standard information: name, maker,
-  model, serial number, firmware and battery.
+  model, serial number, firmware and battery. A device that advertises
+  no name keeps the one it reads, also through its address changes.
 - **The speaker button** beeps while you search: faster, and a little
   higher, as the signal gets stronger. Walk towards the faster beeps and
   look at the room instead of the screen.
@@ -194,6 +221,8 @@ neighbour's tag) or **Following you**.
   9:10–now*, and pointing at its number of places shows the same.
   *Unknown place* is time with you before a place was recognized, or on
   the way between places.
+- **Hover** a tracker for its card, like on the Scan page, topped with
+  the verdict, its time with you, and where and when it was with you.
 - **Out of range** trackers (not heard for 30 seconds) are left out,
   unless they may be following you. **Show out of range** lists them
   all.
@@ -204,10 +233,12 @@ neighbour's tag) or **Following you**.
   watches, bands and health devices, phones and tablets, or anything
   else that could travel. TVs, speakers and beacons stay put, so they're
   never watched. Most phones, AirPods and watches change their Bluetooth
-  address every 15 minutes or so, so they can't be followed from place
-  to place. Devices that keep their address can, like many fitness
-  bands, cheap earbuds and GPS trackers. Devices of those kinds that
-  only passed by are forgotten after 3 hours.
+  address every 15 minutes or so. Blue Station follows them through
+  each change it hears, so one that travels with you stays one device;
+  one that changes out of earshot starts over. Devices that keep their
+  address, like many fitness bands, cheap earbuds and GPS trackers, are
+  the easiest to follow. Devices of those kinds that only passed by are
+  forgotten after 3 hours.
 - **This is mine**, on a device's own page, leaves one of your own
   devices alone. **Watch my devices again** in the Watch for menu undoes
   it for all of them.
@@ -273,8 +304,10 @@ Pick a device on the left.
   in front or the Mac is on battery. So "live" means about once a
   second: plenty for finding things and watching trends.
 - Phones and many other devices change their Bluetooth address every
-  few minutes for privacy, so one phone can show up as several devices
-  over an afternoon.
+  15 minutes or so for privacy. Blue Station follows the changes it
+  hears, and the ones it can recognize by learned bytes, but a phone
+  whose change it misses (out of range at the time, or silent for a
+  while) shows up as a new device.
 - macOS shows each device under an address of its own making (a UUID
   that's the same only on your Mac). Where it can, Blue Station also
   shows the real Bluetooth address.
@@ -308,8 +341,9 @@ Nothing is recorded unless you export it, except two small files kept in
 your system's usual place for app data (and, with **Start at login**,
 the LaunchAgent and small app described under *In the menu bar*):
 
-- `settings.json`: settings, and the names, pins, calibrations and
-  alerts you give devices.
+- `settings.json`: settings, the names, pins, calibrations and alerts
+  you give devices, and which bytes of each kind of advertisement it
+  has learned stay the same through an address change.
 - `trackers.json`: the tracker watch's memory, meaning which trackers
   it has seen and when, which devices you said are yours, and your
   places: their landmarks (the per-Mac IDs of named devices) and the
@@ -340,6 +374,7 @@ python3 packaging/build_icon.py      # rebuild the app icon after editing packag
   - `decode.py`: what an advertisement says (kinds, makers, beacons, Apple, Microsoft...)
   - `watch.py`: trackers, places and landmarks, and each device's timeline
   - `alerts.py`: out of range and back again, for the devices you asked about
+  - `links.py`: following a device through its address changes, and what it learns from them
   - `baseline.py`: New only's baseline, and which devices are new
   - `survey.py`: survey points and the map's estimate
   - `packets.py`: the packet log

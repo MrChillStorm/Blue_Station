@@ -185,7 +185,13 @@ _DEMO = [
     ("Thermo Sensor 3A", -80, 1, dict(service_uuids=(_uuid16(0x181A),),
                                       manufacturer_data={0x0059: bytes.fromhex("0bd4")}), (0, None)),
     (None, -90, 1, dict(service_uuids=(_uuid16(0xFEED),)), (0, 45)),
+    # an iPad that changes its Bluetooth address after 100 seconds, like Apple devices do every 15 minutes
+    (None, -67, 3, dict(manufacturer_data={0x004C: bytes.fromhex("1006" + "3b1c2d3e4f5a")}, connectable=True,
+                        tx_power=12), (0, 100)),
+    (None, -67, 3, dict(manufacturer_data={0x004C: bytes.fromhex("1006" + "3b1c2d3e4f5a")}, connectable=True,
+                        tx_power=12), (103, None)),
 ]
+_SAME_DEVICE = {14: 13}  # a later address -> the earlier one of the same device: its signal carries on
 
 
 class DemoScanner:
@@ -218,6 +224,8 @@ class DemoScanner:
             age = now - self._t0
             if age < appears or (leaves is not None and age > leaves):
                 continue
+            if i in _SAME_DEVICE and self._walk[i] == 0.0:
+                self._walk[i] = self._walk[_SAME_DEVICE[i]]
             expected = rate * since
             count = int(expected) + (self._rng.random() < expected % 1)
             for k in range(count):

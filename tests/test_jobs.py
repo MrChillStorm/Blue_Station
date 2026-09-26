@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from blue_station.core import gatt, login
 from blue_station.core.alerts import BACK, GONE, Alerts
 from blue_station.core.baseline import Baseline
+from blue_station.core.links import Linker
 from blue_station.core.devices import Device, DeviceStore, Sighting, gap_stats
 from blue_station.core.packets import PacketLog
 from blue_station.core.scanner import Scanner
@@ -277,6 +278,165 @@ class BaselineTest(unittest.TestCase):
         near = lambda d: d.smoothed >= -80
         self.assertEqual([d.address for d in baseline.arrivals(14, devices, near)], ["CLOSE"])
         self.assertEqual(baseline.arrivals(15, devices, near), [])  # once
+
+
+NEARBY_INFO = {0x004C: bytes.fromhex("1006" + "0b1c2d3e4f50")}  # an Apple device's Nearby Info
+HANDOFF = {0x004C: bytes.fromhex("0c0e" + "00" * 14)}
+
+
+class AddressChangeTest(unittest.TestCase):
+    """A device changing its address, the way an hour at home showed it."""
+
+    def play(self, spans: dict, until: int, names: dict | None = None):
+        """spans: address -> (from, to, rssi, advert), a packet a second; an advert that's a list takes
+        turns. names: the ones macOS knows."""
+        names = names or {}
+        store, linker, links = DeviceStore(), Linker(), []
+        crowd = {f"FAR-{i}": (0, until, -95 - i, {0x0075: bytes([i])}) for i in range(8)}  # the faint ones around
+        for t in range(until * 2):
+            t /= 2
+            store.ingest([Sighting(a, rssi, t, name=names.get(a),
+                                   manufacturer_data=advert[int(t) % len(advert)] if isinstance(advert, list) else advert)
+                          for a, (start, end, rssi, advert) in {**spans, **crowd}.items() if start <= t <= end and t % 1 == 0])
+            for old, new, sure in linker.update(t, store.devices.values()):
+                store.hand_over(old, new, sure)
+                links.append((old.address, new.address, sure))
+        return store, links
+
+    def test_a_device_changing_its_address_is_followed(self):
+        store, links = self.play({"OLD": (0, 100, -69, NEARBY_INFO), "NEW": (103, 200, -68, NEARBY_INFO)}, 200)
+        self.assertEqual([(o, n) for o, n, _ in links], [("OLD", "NEW")])
+        self.assertGreater(links[0][2], 0.8)
+        new, old = store.devices["NEW"], store.devices["OLD"]
+        self.assertEqual(old.superseded_by, "NEW")
+        self.assertEqual(new.earlier, [("OLD", links[0][2])])
+        self.assertEqual(new.first_seen, 0)  # one device, heard since the start
+        self.assertEqual(new.history[0][0], 0)
+
+    def test_a_name_carries_over(self):
+        # macOS knew the old address's name after a connection; the new address starts without one
+        store, links = self.play({"OLD": (0, 100, -69, NEARBY_INFO), "NEW": (103, 200, -68, NEARBY_INFO)}, 200,
+                                 names={"OLD": "Office Mac"})
+        self.assertEqual([(o, n) for o, n, _ in links], [("OLD", "NEW")])
+        self.assertEqual(store.devices["NEW"].title, "Office Mac")
+
+    def test_two_names_are_two_devices(self):
+        _, links = self.play({"OLD": (0, 100, -69, NEARBY_INFO), "NEW": (103, 200, -68, NEARBY_INFO)}, 200,
+                             names={"OLD": "Office Mac", "NEW": "Kitchen iPad"})
+        self.assertEqual(links, [])
+
+    def test_a_stranger_isnt_it(self):
+        _, links = self.play({"OLD": (0, 100, -69, NEARBY_INFO),
+                              "OTHER-KIND": (102, 200, -69, HANDOFF),  # a different advertisement
+                              "FAR-AWAY": (102, 200, -97, NEARBY_INFO)}, 200)  # the same, but from elsewhere
+        self.assertEqual(links, [])
+
+    def test_two_alike_changing_together_stay_apart(self):
+        _, links = self.play({"A": (0, 100, -69, NEARBY_INFO), "B": (0, 100, -70, NEARBY_INFO),
+                              "A2": (102, 200, -69, NEARBY_INFO), "B2": (103, 200, -70, NEARBY_INFO)}, 200)
+        self.assertEqual(links, [])  # could be either way round: no guessing
+
+    def test_one_still_talking_wasnt_replaced(self):
+        _, links = self.play({"OLD": (0, 150, -69, NEARBY_INFO), "NEW": (103, 200, -69, NEARBY_INFO)}, 200)
+        self.assertEqual(links, [])
+
+    @staticmethod
+    def airplay(ident: bytes, salt: int) -> dict:
+        """Like an AirPlay target: steady bytes (its network address) and a rotating part."""
+        return {0x004C: bytes([0x09, 8]) + ident + bytes([0x16, 8]) + bytes((salt * 37 + i * 11) % 256 for i in range(8))}
+
+    @staticmethod
+    def nearby(salt: int) -> dict:
+        """Like Apple's Nearby Info: every byte but the header changes."""
+        return {0x004C: bytes([0x10, 6]) + bytes((salt * 53 + i * 29) % 256 for i in range(6))}
+
+    def test_learned_bytes_recognize_a_change_nobody_heard(self):
+        home = bytes.fromhex("1302c0a8004a1b58")
+        spans = {"A1": (0, 100, -69, self.airplay(home, 1)), "A2": (103, 200, -69, self.airplay(home, 2)),
+                 "A3": (203, 300, -69, self.airplay(home, 3)),
+                 "A4": (520, 700, -75, self.airplay(home, 4)),  # 220 s of silence: the Mac slept
+                 "STRANGER": (521, 700, -74, self.airplay(bytes.fromhex("1302c0a8004b1b58"), 5))}
+        _, links = self.play(spans, 700)
+        self.assertEqual([(o, n) for o, n, _ in links], [("A1", "A2"), ("A2", "A3"), ("A3", "A4")])
+        self.assertGreater(links[-1][2], 0.9)
+
+    def test_one_change_is_enough_to_start_recognizing(self):
+        home = bytes.fromhex("1302c0a8004a1b58")
+        spans = {"A1": (0, 100, -69, self.airplay(home, 1)), "A2": (103, 200, -69, self.airplay(home, 2)),
+                 "A3": (420, 600, -75, self.airplay(home, 3)),  # after one heard change, one nobody heard
+                 "STRANGER": (421, 600, -74, self.airplay(bytes.fromhex("1302c0a8004b1b58"), 5))}
+        store, links = self.play(spans, 600)
+        self.assertEqual([(o, n) for o, n, _ in links], [("A1", "A2"), ("A2", "A3")])
+        self.assertFalse(store.devices["A3"].fingerprint_confirmed)  # tentative so far
+
+    def test_a_byte_the_same_by_chance_doesnt_block_the_next_change(self):
+        home = bytes.fromhex("1302c0a8004a1b58")
+        first, second = self.airplay(home, 1), self.airplay(home, 2)
+        second[0x004C] = second[0x004C][:12] + first[0x004C][12:13] + second[0x004C][13:]  # one rotating byte alike
+        spans = {"A1": (0, 100, -69, first), "A2": (103, 200, -69, second),
+                 "A3": (203, 300, -69, self.airplay(home, 3))}  # heard, and that byte differs now
+        store, links = self.play(spans, 300)
+        self.assertEqual([(o, n) for o, n, _ in links], [("A1", "A2"), ("A2", "A3")])
+        self.assertEqual(store.devices["A3"].fingerprint_bytes, 8)  # the chance byte dropped: the steady 8 are left
+
+    def test_an_occasional_extra_message_doesnt_hide_it(self):
+        home = bytes.fromhex("1302c0a8004a1b58")
+        usual = self.airplay(home, 1)
+        extra = {0x004C: usual[0x004C][:10] + bytes([0x15, 2, 0x00, 0x34]) + usual[0x004C][10:]}
+        # the old address's last packet happens to carry the extra message
+        _, links = self.play({"OLD": (0, 99, -69, [extra, usual, usual]),
+                              "NEW": (102, 200, -69, self.airplay(home, 2))}, 200)
+        self.assertEqual([(o, n) for o, n, _ in links], [("OLD", "NEW")])
+
+    def test_a_status_byte_isnt_a_fingerprint(self):
+        spans = {f"T{i}": (i * 103, i * 103 + 100, -69, {0x004C: bytes([0x12, 2, 0x00, i % 4])}) for i in range(3)}
+        spans["T3"] = (600, 700, -69, {0x004C: bytes([0x12, 2, 0x00, 3])})
+        _, links = self.play(spans, 700)
+        self.assertNotIn(("T2", "T3"), [(o, n) for o, n, _ in links])  # unheard, and nothing to go on
+
+    def test_partners_change_together_and_come_along(self):
+        home = bytes.fromhex("1302c0a8004a1b58")
+        spans = {}
+        for i, (start, end) in enumerate([(0, 100), (103, 200), (203, 300), (520, 700)]):
+            spans[f"TV{i}"] = (start, end, -69, self.airplay(home, i))
+            spans[f"NI{i}"] = (start + 1, end, -68, self.nearby(i))  # the same box's other advertisement
+        store, links = self.play(spans, 700)
+        pairs = [(o, n) for o, n, _ in links]
+        self.assertIn(("TV2", "TV3"), pairs)  # by its fingerprint...
+        self.assertIn(("NI2", "NI3"), pairs)  # ... and its partner along with it
+        tv, ni = store.devices["TV3"], store.devices["NI3"]
+        self.assertIs(tv.partner, ni)
+
+    def test_what_is_learned_is_kept(self):
+        home = bytes.fromhex("1302c0a8004a1b58")
+        store = DeviceStore()
+        store.ingest([Sighting("A", -69, 0, manufacturer_data=self.airplay(home, 1)),
+                      Sighting("B", -69, 1, manufacturer_data=self.airplay(home, 2))])
+        linker = Linker()
+        for _ in range(2):
+            linker.learn(store.devices["A"], store.devices["B"], 0.9)
+        again = Linker(linker.to_dict())
+        self.assertEqual(again.fingerprint(store.devices["B"]), home)
+
+    def test_what_carries_over(self):
+        store = DeviceStore({"OLD": {"nickname": "Kitchen iPad", "pinned": True, "alert_gone": True}})
+        store.ingest([Sighting("OLD", -69, 0), Sighting("NEW", -69, 5)])
+        store.hand_over(store.devices["OLD"], store.devices["NEW"], 0.9)
+        new = store.devices["NEW"]
+        self.assertEqual((new.nickname, new.pinned, new.alert_gone), ("Kitchen iPad", True, True))
+        self.assertEqual(store.known, {"NEW": {"nickname": "Kitchen iPad", "pinned": True, "alert_gone": True}})
+        watcher = Watcher(groups=("trackers", "phones"))
+        watcher.trackers["OLD"] = __import__("blue_station.core.watch", fromlist=["TrackerRecord"]).TrackerRecord(
+            "OLD", "Phone", 0, 4, 4.0, {1, 2}, "phones", [[1, 0, 2], [2, 3, 4]])
+        watcher.mine.add("OLD")
+        watcher.hand_over("OLD", "NEW")
+        self.assertEqual(watcher.trackers["NEW"].places, {1, 2})  # still following you
+        self.assertIn("NEW", watcher.mine)
+        alerts = Alerts()
+        alerts.hand_over("OLD", "NEW")
+        self.assertTrue(alerts._here["NEW"])  # not an arrival
+        baseline = Baseline(0, [store.devices["OLD"]])
+        self.assertFalse(baseline.is_new(new))  # known under its earlier address
 
 
 class LoginTest(unittest.TestCase):

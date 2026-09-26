@@ -182,11 +182,6 @@ def stylesheet(c: dict) -> str:
         width: 15px; height: 15px; border: 1px solid {c['check_border']}; border-radius: 4px; background: {c['surface']};
     }}
     QCheckBox::indicator:checked {{ background: {c['check_bg']}; border-color: {c['check_bg']}; image: url("{check}"); }}
-    QSlider::groove:horizontal {{ height: 4px; background: {c['border']}; border-radius: 2px; }}
-    QSlider::handle:horizontal {{
-        width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; background: {c['accent']};
-    }}
-    QSlider::handle:horizontal:disabled {{ background: {c['faint']}; }}
     """
 
 

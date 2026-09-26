@@ -107,6 +107,35 @@ def card() -> QFrame:
     return frame
 
 
+class ElidedLabel(QLabel):
+    """One line that gives way: when the row runs short of room, it ends
+    in … (the whole text is in its tooltip) instead of squeezing its
+    neighbours."""
+
+    def __init__(self, text: str = "", name: str | None = None):
+        super().__init__(text)
+        if name:
+            self.setObjectName(name)
+        policy = self.sizePolicy()
+        policy.setHorizontalPolicy(policy.Policy.Ignored)
+        self.setSizePolicy(policy)
+
+    def setText(self, text: str) -> None:
+        super().setText(text)
+        self.setToolTip(text if self.fontMetrics().horizontalAdvance(text) > self.width() else "")
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.setToolTip(self.text() if self.fontMetrics().horizontalAdvance(self.text()) > self.width() else "")
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setPen(self.palette().color(self.foregroundRole()))
+        p.drawText(self.contentsRect(), int(self.alignment()),
+                   self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight, self.contentsRect().width()))
+        p.end()
+
+
 def label(text: str = "", name: str | None = None) -> QLabel:
     lab = QLabel(text)
     if name:
@@ -139,6 +168,16 @@ def advertisement_rows(device: Device) -> list[tuple[str, str]]:
             ("Maker", device.info.vendor or "—"), ("Address", device.address)]
     if device.mac:
         rows.append(("Bluetooth address", device.mac))
+    if device.earlier:  # the same device under earlier addresses (links.py)
+        n, least = len(device.earlier), round(100 * min(p for _, p in device.earlier))
+        since = datetime.fromtimestamp(device.first_seen).strftime("%H:%M")
+        rows.append(("Address changes", f"Once since {since}, {least}\u00a0% sure" if n == 1  # 91 % kept together
+                     else f"{n} times since {since}, each at least {least}\u00a0% sure"))
+    if device.fingerprint_bytes:
+        rows.append(("Recognized by", f"{device.fingerprint_bytes} bytes it keeps when it changes address"
+                     + ("" if device.fingerprint_confirmed else " (seen through one change so far)")))
+    if device.partner is not None:
+        rows.append(("Also sends", f"{device.partner.info.kind or 'another advertisement'}, changing address with it"))
     rows.append(("Connectable", {True: "Yes", False: "No", None: "—"}[device.connectable]))
     if device.tx_power is not None:
         rows.append(("TX power", f"{device.tx_power} dBm"))
@@ -154,11 +193,12 @@ def advertisement_rows(device: Device) -> list[tuple[str, str]]:
 
 
 def kv_html(rows: list[tuple[str, str]], c: dict, key_width: int = 130) -> str:
-    """A two-column table of muted keys and selectable values, for QLabel."""
+    """A two-column table of muted keys and selectable values, for QLabel.
+    Its full width, so a long value wraps instead of running off the edge."""
     cells = "".join(
         f"<tr><td width='{key_width}' style='color:{c['muted']}; padding:2px 10px 2px 0'>{esc(k)}</td>"
         f"<td style='padding:2px 0'>{esc(v)}</td></tr>" for k, v in rows)
-    return f"<table cellspacing='0' cellpadding='0'>{cells}</table>"
+    return f"<table width='100%' cellspacing='0' cellpadding='0'>{cells}</table>"
 
 
 # ---- painting -------------------------------------------------------------------
@@ -381,13 +421,15 @@ class HoverCard(QFrame):
         layout.addWidget(self.chart)
         self.details = QLabel()
         self.details.setTextFormat(Qt.TextFormat.RichText)
+        self.details.setWordWrap(True)  # the card is only so wide: long values take a second line
         layout.addWidget(self.details)
         self.hint = label("Click to track this device", "faint")
         layout.addWidget(self.hint)
         self.setFixedWidth(380)
         self.device: Device | None = None
 
-    def show_device(self, device: Device, now: float) -> None:
+    def show_device(self, device: Device, now: float, extra: list[tuple[str, str]] | None = None) -> None:
+        """extra: a page's own rows, shown first."""
         c = colors()
         self.device = device
         self.icon.setPixmap(icons.pixmap(device.info.icon, c["accent"], 26))
@@ -397,16 +439,22 @@ class HoverCard(QFrame):
                             f"<span style='color:{c['faint']}; font-size:12px'> dBm</span>")
         self.chart.show_device(device, now)
         stats = device.stats(now, 60)
-        rows = [("Signal", f"{quality(device.smoothed)}" + (
+        rows = list(extra or []) + [("Signal", f"{quality(device.smoothed)}" + (
                     f"  ·  {dbm(stats.low)} to {dbm(stats.high)} over 1 min" if stats else "")),
                 ("Distance", f"{distance_text(device.distance())}  (rough)"),
                 ("Last seen", ago_text(device.age(now))),
                 ("Packets", f"{device.packets}  ·  {device.rate(now):.1f} per second")]
         address = device.mac or device.address
         rows.append(("Address", address if len(address) <= 20 else f"{address[:8]}…{address[-6:]}"))
-        rows += [r for r in advertisement_rows(device) if r[0] in ("Connectable", "TX power", "Service")][:6]
+        rows += [r for r in advertisement_rows(device)
+                 if r[0] in ("Address changes", "Recognized by", "Also sends", "Connectable", "TX power",
+                             "Service")][:6]
         rows += device.info.fields[:6]
-        self.details.setText(kv_html(rows, c, 100))
+        self.details.setText(kv_html(rows, c, 118))  # room for "Address changes" on one line
+        # wrapped lines need height the card wouldn't reserve by itself: as tall as they are at its width
+        inner = self.width() - 2 * 14 - 2
+        self.details.ensurePolished()  # measured in the style's font, not the default one it has before showing
+        self.details.setMinimumHeight(self.details.heightForWidth(inner))
         self.adjustSize()
 
     def place(self, pos: QPoint) -> None:
@@ -482,6 +530,87 @@ class ScanIndicator(QWidget):
         p.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    p.fontMetrics().elidedText(self.text, Qt.TextElideMode.ElideRight, text_rect.width()))
         p.end()
+
+
+class RangeSlider(QWidget):
+    """A slider with two handles, for a low and a high end. The handles
+    can't cross, and clicking the groove moves the nearer one there."""
+    valuesChanged = Signal(int, int)
+    HANDLE = 14
+
+    def __init__(self, minimum: int, maximum: int, low: int, high: int, parent=None):
+        super().__init__(parent)
+        self.minimum, self.maximum = minimum, maximum
+        self.low, self.high = low, high
+        self._dragging: str | None = None
+        self.setFixedHeight(20)
+        self.setMinimumWidth(80)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def sizeHint(self) -> QSize:
+        return QSize(120, 20)
+
+    def setValues(self, low: int, high: int) -> None:
+        low = max(self.minimum, min(self.maximum, int(low)))
+        high = max(low, min(self.maximum, int(high)))
+        if (low, high) != (self.low, self.high):
+            self.low, self.high = low, high
+            self.update()
+            self.valuesChanged.emit(low, high)
+
+    def values(self) -> tuple[int, int]:
+        return self.low, self.high
+
+    def _span(self) -> tuple[float, float]:
+        half = self.HANDLE / 2
+        return half, self.width() - half
+
+    def _x(self, value: int) -> float:
+        left, right = self._span()
+        return left + (value - self.minimum) / (self.maximum - self.minimum) * (right - left)
+
+    def _value(self, x: float) -> int:
+        left, right = self._span()
+        share = min(1.0, max(0.0, (x - left) / max(1.0, right - left)))
+        return round(self.minimum + share * (self.maximum - self.minimum))
+
+    def paintEvent(self, event) -> None:
+        c = colors()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        mid = self.height() / 2
+        left, right = self._span()
+        on = self.isEnabled()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(c["border"]))
+        p.drawRoundedRect(QRectF(left, mid - 2, right - left, 4), 2, 2)
+        p.setBrush(QColor(c["accent"] if on else c["faint"]))
+        p.drawRoundedRect(QRectF(self._x(self.low), mid - 2, self._x(self.high) - self._x(self.low), 4), 2, 2)
+        for value in (self.low, self.high):
+            p.drawEllipse(QPointF(self._x(value), mid), self.HANDLE / 2, self.HANDLE / 2)
+        p.end()
+
+    def mousePressEvent(self, event) -> None:
+        x = event.position().x()
+        # the nearer handle; when they sit together, the side you pressed on decides
+        low_gap, high_gap = abs(x - self._x(self.low)), abs(x - self._x(self.high))
+        if low_gap == high_gap:
+            self._dragging = "low" if x < self._x(self.low) else "high"
+        else:
+            self._dragging = "low" if low_gap < high_gap else "high"
+        self.mouseMoveEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._dragging is None:
+            return
+        value = self._value(event.position().x())
+        if self._dragging == "low":
+            self.setValues(min(value, self.high), self.high)
+        else:
+            self.setValues(self.low, max(value, self.low))
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._dragging = None
 
 
 class Segmented(QFrame):

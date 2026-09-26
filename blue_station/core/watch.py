@@ -17,9 +17,10 @@ your home before the café is recognized.
 
 Item trackers are watched by default; other kinds of device can be
 added (GROUPS). Most phones, earbuds and watches change their address
-every 15 minutes or so, so only the ones with a fixed address can be
-followed from place to place. Devices you say are yours are left
-alone."""
+every 15 minutes or so. A change heard as it happens carries the record
+over (links.py, hand_over); one out of earshot starts it over, so the
+ones with a fixed address are the easiest to follow. Devices you say
+are yours are left alone."""
 from dataclasses import dataclass, field
 
 FOLLOW_PLACES = 2
@@ -278,6 +279,29 @@ class Watcher:
         self.current = self.settled = None
         self.next_place = 1
         self._strikes = 0
+
+    def hand_over(self, old: str, new: str) -> None:
+        """A device changed its address (see links.py): its record, and
+        whether it's yours, carry on under the new one."""
+        record = self.trackers.pop(old, None)
+        if record is not None:
+            later = self.trackers.get(new)
+            record.address = new
+            if later is not None:  # heard under the new address before the change was spotted
+                record.last_seen = max(record.last_seen, later.last_seen)
+                record.seen_seconds += later.seen_seconds
+                record.places |= later.places
+                for place, start, end in later.visits:
+                    record.visit(place, start)
+                    record.visit(place, end)
+            self.trackers[new] = record
+        if old in self.mine:
+            self.mine.add(new)
+        if old in self.companions:
+            self.companions.add(new)
+        for place in self.places.values():
+            if old in place.landmarks:
+                place.landmarks.add(new)
 
     def name_place(self, place: Place, name: str) -> None:
         place.name = name.strip() or None

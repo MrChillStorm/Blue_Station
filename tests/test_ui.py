@@ -147,16 +147,20 @@ class DevicesTest(WindowCase):
         self.assertNotIn(weak, shown)
         self.assertIn(pinned, shown)  # pinned ones stay
         self.assertTrue(all(d.pinned or d.smoothed >= -84 for d in shown))
-        self.assertIn("weaker than −80 dBm hidden", page.detail.text())
+        self.assertRegex(page.detail.text(), r"^\d+ hidden by Nearby only")
         before = len(shown)
-        page.near_slider.setValue(-55)  # stricter: fewer count as nearby
+        page.near_slider.setValues(-55, -30)  # stricter: fewer count as nearby
         self.window.tick()
-        self.assertEqual(page.near_value.text(), "−55 dBm")
+        self.assertEqual(page.near_value.text(), "−55 dBm and up")
         self.assertLess(len(page.model.rows), before)
-        self.assertTrue(all(d.pinned or d.smoothed >= -59 for d in page.model.rows))
+        self.assertTrue(all(d.pinned or d.smoothed >= -55 for d in page.model.rows))
+        page.near_slider.setValues(-70, -60)  # a bracket: not too far, and not right here either
+        self.window.tick()
+        self.assertEqual(page.near_value.text(), "−70 to −60 dBm")
+        self.assertTrue(all(d.pinned or -70 <= d.smoothed <= -60 for d in page.model.rows))
         self.window.close()
         self.assertTrue(prefs.load()["nearby_only"])
-        self.assertEqual(prefs.load()["nearby_dbm"], -55)
+        self.assertEqual((prefs.load()["nearby_dbm"], prefs.load()["nearby_max"]), (-70, -60))
 
     def test_new_only(self):
         page = self.window.devices
@@ -182,6 +186,24 @@ class DevicesTest(WindowCase):
         self.assertFalse(page.new_bell.isChecked())
         self.assertFalse(page.new_bell.isEnabled())
 
+    def test_range_slider_by_mouse(self):
+        from PySide6.QtTest import QTest
+        from blue_station.ui.widgets import RangeSlider
+        slider = RangeSlider(-100, -30, -80, -30)
+        slider.resize(120, 20)
+        seen = []
+        slider.valuesChanged.connect(lambda low, high: seen.append((low, high)))
+        right_end = QPoint(round(slider._x(-30)), 10)
+        QTest.mousePress(slider, Qt.MouseButton.LeftButton, pos=right_end)  # the high handle
+        QTest.mouseMove(slider, QPoint(round(slider._x(-60)), 10))
+        QTest.mouseRelease(slider, Qt.MouseButton.LeftButton, pos=QPoint(round(slider._x(-60)), 10))
+        self.assertEqual(slider.values(), (-80, -60))
+        QTest.mousePress(slider, Qt.MouseButton.LeftButton, pos=QPoint(round(slider._x(-80)), 10))  # the low one
+        QTest.mouseMove(slider, QPoint(118, 10))  # dragged past the high handle...
+        QTest.mouseRelease(slider, Qt.MouseButton.LeftButton, pos=QPoint(118, 10))
+        self.assertEqual(slider.values(), (-60, -60))  # ... it stops there
+        self.assertEqual(seen[-1], (-60, -60))
+
     def test_hover_card(self):
         page = self.window.devices
         device = page.model.rows[0]
@@ -189,6 +211,19 @@ class DevicesTest(WindowCase):
         page.hover.card.place(QPoint(100, 100))
         self.assertIn(device.title, page.hover.card.title.text())
         self.assertIn("Address", page.hover.card.details.text())
+
+    def test_hover_card_fits_long_values(self):
+        card = self.window.devices.hover.card
+        device = self.device("Fitness Band")
+        device.earlier = [("OLD-1", 0.93), ("OLD-2", 0.91)]
+        long_rows = [("Where", "unknown place 16:13–16:15, and then some more words to wrap"), ("", "Home 16:15–now")]
+        card.show_device(device, time.time(), long_rows)  # the first time: before the card was ever shown
+        card.show()
+        QApplication.processEvents()
+        details = card.details
+        self.assertGreaterEqual(details.height(), details.heightForWidth(details.width()))  # nothing cut off
+        self.assertLessEqual(details.width(), card.width())
+        card.hide()
 
     def test_clear_and_export(self):
         path = Path(self.tmp.name) / "devices.csv"
@@ -300,6 +335,20 @@ class TrackTest(WindowCase):
         self.assertIn("Battery", track.gatt.text())
         self.assertTrue(track.read_btn.isEnabled())
 
+    def test_a_name_read_from_the_device_is_kept(self):
+        ipad = next(d for d in self.window.store.devices.values()
+                    if d.manufacturer_data.get(0x004C, b"")[:2] == bytes.fromhex("1006"))
+        self.assertIsNone(ipad.name)  # it advertises none
+        self.window.show_device(ipad)
+        track = self.window.track
+        track.read()
+        deadline = time.time() + 5
+        while track._future is not None and time.time() < deadline:
+            time.sleep(0.1)
+            track.tick(time.time())
+        self.assertEqual(ipad.name, "Demo device")  # what its Device Name said
+        self.assertEqual(ipad.title, "Demo device")
+
     def test_gatt_failure_is_shown(self):
         self.open("Thermo Sensor 3A")  # the demo's sensor doesn't accept connections
         track = self.window.track
@@ -355,6 +404,26 @@ class TrackersJobTest(WindowCase):
         self.window.watcher.forget()
         self.window.tick()
         self.assertIn("Nothing is following you", page.headline.text())
+
+    def test_hover_card(self):
+        from PySide6.QtTest import QTest
+        self.window.show()
+        self.window.show_job(TRACKERS)
+        page = self.window.trackers
+        self.window.watcher.update(time.time(), list(self.window.store.devices.values()), force=True)
+        self.window.tick()
+        QApplication.processEvents()
+        seen = []
+        page.table.hovered.connect(lambda device, pos: seen.append(device))
+        QTest.mouseMove(page.table.viewport(), page.table.visualRect(page.model.index(0, 0)).center())
+        self.assertTrue(seen and seen[-1] is not None)
+        device = seen[-1]
+        self.assertEqual(device.address, page.model.rows[0].address)
+        page.hover.card.show_device(device, time.time(), page._card_rows(device))
+        details = page.hover.card.details.text()
+        self.assertIn("Verdict", details)
+        self.assertIn("With you", details)
+        self.window.hide()
 
     def test_filter(self):
         self.window.show_job(TRACKERS)
@@ -695,6 +764,51 @@ class MenuBarTest(WindowCase):
             QTest.qWait(50)
         self.assertTrue(self.window.isVisible())
         server.close()
+
+
+class AddressChangeTest(WindowCase):
+    def test_the_demo_ipad_stays_one_device(self):
+        from blue_station.ui.widgets import advertisement_rows
+        self.window.store.devices.clear()  # setUp's 30 s also end now, with the first address still talking
+        self.feed(130)  # the demo's iPad changes its address at 100 s
+        page = self.window.devices
+        page.gone.setChecked(True)  # even with out-of-range ones listed
+        self.window.linker._checked = float("-inf")  # it looks every 2 s; the test doesn't wait
+        self.window.tick()
+        ipads = [d for d in self.window.store.devices.values()
+                 if d.manufacturer_data.get(0x004C, b"")[:2] == bytes.fromhex("1006")]
+        self.assertEqual(len(ipads), 2)
+        new = next(d for d in ipads if d.superseded_by is None)
+        old = next(d for d in ipads if d is not new)
+        self.assertEqual(old.superseded_by, new.address)
+        self.assertEqual([a for a, _ in new.earlier], [old.address])
+        self.assertIn(new, page.model.rows)
+        self.assertNotIn(old, page.model.rows)
+        self.assertIn("Address changes", dict(advertisement_rows(new)))
+
+
+class PartnerTest(WindowCase):
+    def test_one_device_sending_two_kinds_is_listed_once(self):
+        from blue_station.ui.widgets import advertisement_rows
+        page = self.window.devices
+        ipad = next(d for d in self.window.store.devices.values()
+                    if d.manufacturer_data.get(0x004C, b"")[:2] == bytes.fromhex("1006"))
+        airplay = self.device("Living Room TV")
+        airplay.partner, ipad.partner = ipad, airplay
+        airplay.fingerprint_bytes = 8
+        page.model.refresh(time.time(), force=True)
+        rows = page.model.rows
+        self.assertEqual(len([d for d in (airplay, ipad) if d in rows]), 1)  # the more telling one
+        listed = airplay if airplay in rows else ipad
+        details = dict(advertisement_rows(listed))
+        self.assertIn("changing address with it", details["Also sends"])
+        self.assertIn("8 bytes", dict(advertisement_rows(airplay))["Recognized by"])
+
+    def test_what_is_learned_is_saved(self):
+        self.window.linker.steady["some kind"] = {2, 3, 4}
+        self.window.linker.changes["some kind"] = 2
+        self.window.close()
+        self.assertEqual(prefs.load()["learned_bytes"]["some kind"], {"steady": [2, 3, 4], "changes": 2})
 
 
 class ThemeTest(WindowCase):

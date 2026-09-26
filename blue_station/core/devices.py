@@ -127,6 +127,12 @@ class Device:
         self.calibration: int | None = None  # the signal measured at 1 m
         self.alert_gone = False  # a notification when it goes out of range...
         self.alert_back = False  # ... and when it comes back
+        # the same device under earlier addresses (see links.py): [(address, how sure), ...], oldest first
+        self.earlier: list[tuple[str, float]] = []
+        self.superseded_by: str | None = None  # this address was handed over to that one
+        self.partner: Device | None = None  # the same device's other advertisement (links.py)
+        self.fingerprint_bytes = 0  # bytes it keeps through address changes, when enough to recognize it by
+        self.fingerprint_confirmed = False  # ... seen through more than one change
 
     # ---- taking in packets -------------------------------------------------------
 
@@ -173,12 +179,27 @@ class Device:
         self.last_seen = max(self.last_seen, s.t)
         self.packets += 1
 
+    def learn_name(self, name: str | None) -> None:
+        """A name known some other way than its advertisement: read from
+        the device itself, or carried over from its earlier address."""
+        if name and not self.name:
+            self.name = name
+            self._payload = (self.name, tuple(self.manufacturer_data.items()), tuple(self.service_uuids),
+                             tuple(self.service_data.items()))
+            self.info = decode(self.name, self.manufacturer_data, self.service_uuids, self.service_data,
+                               self.eddystone or None)
+
     def _eddystone_turn(self, key: str, old: bytes, new: bytes) -> bool:
         """An Eddystone beacon switching between frame types isn't a change of
         payload."""
         return key == payload_key(_EDDYSTONE) and old[:1] != new[:1]
 
     # ---- what follows ------------------------------------------------------------
+
+    @property
+    def root(self) -> str:
+        """Its first address: the same through all its address changes."""
+        return self.earlier[0][0] if self.earlier else self.address
 
     @property
     def title(self) -> str:
@@ -313,6 +334,25 @@ class DeviceStore:
             self.known[device.address] = prefs
         else:
             self.known.pop(device.address, None)
+
+    def hand_over(self, old: Device, new: Device, sure: float) -> None:
+        """The new address is the old one's device: it carries on with its
+        history and name, and with the name, pin, calibration and alerts you
+        gave it."""
+        new.earlier = old.earlier + [(old.address, sure)]
+        new.learn_name(old.name)
+        old.superseded_by = new.address
+        new.first_seen = min(new.first_seen, old.first_seen)
+        new.history = deque(sorted(list(old.history) + list(new.history)))
+        new.packets += old.packets
+        new.nickname = new.nickname or old.nickname
+        new.calibration = new.calibration if new.calibration is not None else old.calibration
+        new.pinned = new.pinned or old.pinned
+        new.alert_gone = new.alert_gone or old.alert_gone
+        new.alert_back = new.alert_back or old.alert_back
+        if old.address in self.known:
+            self.remember(new)
+            self.known.pop(old.address, None)
 
     def clear(self) -> None:
         """Forgets this session's devices, except pinned ones and ones with

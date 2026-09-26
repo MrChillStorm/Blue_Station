@@ -347,7 +347,8 @@ class TrackPage(QWidget):
         t["first"].setToolTip(f"First heard {duration_text(now - d.first_seen)} ago")
         self.chart.show_device(d, now)
 
-        key = (d._payload, d.mac, d.connectable, d.tx_power)
+        key = (d._payload, d.mac, d.connectable, d.tx_power, len(d.earlier), d.fingerprint_bytes,
+               d.partner.address if d.partner else None)
         if key != self._ad_key:
             self._ad_key = key
             self.ad.setText(kv_html(advertisement_rows(d), c))
@@ -459,6 +460,7 @@ class TrackPage(QWidget):
             text = str(exc) or type(exc).__name__
             self.gatt_status.setText(f"Couldn't read it: {text}")
             return
+        self.device.learn_name(dict(result.summary).get("Device name"))  # kept, and carried through address changes
         c = colors()
         count = sum(len(s.characteristics) for s in result.services)
         self.gatt_status.setText(f"Read at {datetime.now():%H:%M:%S}: {len(result.services)} services, "

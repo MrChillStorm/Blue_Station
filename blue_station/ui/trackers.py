@@ -5,7 +5,7 @@ The watching itself runs whichever job is on screen; this page shows it."""
 import time
 from datetime import datetime
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRectF, Qt, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderView, QInputDialog, QLineEdit, QMessageBox, QPushButton,
@@ -16,10 +16,12 @@ from PySide6.QtWidgets import (
 from blue_station.core.decode import short_company
 from blue_station.core.devices import DeviceStore, ago_text, span_text
 from blue_station.core.watch import FOLLOWING, GROUPS, HEARD_WITHIN, STAYING, TrackerRecord, Watcher
-from blue_station.ui.devices import text_matches
+from blue_station.ui.devices import HoverCards, text_matches
 from blue_station.ui import icons
 from blue_station.ui.theme import colors
-from blue_station.ui.widgets import ChecklistMenu, bold, card, dbm, label, link_button, paint_signal, subtitle, when
+from blue_station.ui.widgets import (
+    ChecklistMenu, ElidedLabel, bold, card, dbm, label, link_button, paint_signal, subtitle, when,
+)
 
 TRACKER, SIGNAL, WITH_YOU, PLACES, VERDICT = range(5)
 HEADERS = ["TRACKER", "SIGNAL", "WITH YOU", "PLACES", "VERDICT"]
@@ -35,8 +37,9 @@ EXPLAIN = ("A {noun} counts as following you once it has been with you in two di
            "recognized from named devices that stay put (TVs, printers, speakers), which takes a few minutes after "
            "you arrive. You can also say so yourself with I've moved. If it's one of yours, open it and choose "
            "This is mine.")
-MORE = (" Phones, AirPods and most watches change their Bluetooth address every 15 minutes or so, so they can't be "
-        "followed from place to place. Devices with a fixed address can.")
+MORE = (" Phones, AirPods and most watches change their Bluetooth address every 15 minutes or so. Blue Station "
+        "follows them through a change it hears happen, but one that changes out of earshot starts over as a new "
+        "device. Devices with a fixed address are the easiest to follow.")
 
 
 def only_trackers(watcher: Watcher) -> bool:
@@ -51,6 +54,10 @@ def _clock(t: float, now: float) -> str:
 def timeline(watcher: Watcher, record: TrackerRecord, now: float, last: int = 6) -> str:
     """Where and when it was with you, newest last: 'Home 8:05–8:40  ·
     unknown place 8:40–9:05  ·  Office 9:10–now'."""
+    return "  ·  ".join(timeline_parts(watcher, record, now, last))
+
+
+def timeline_parts(watcher: Watcher, record: TrackerRecord, now: float, last: int = 6) -> list[str]:
     parts = []
     for place, start, end in record.visits[-last:]:
         a = _clock(start, now)
@@ -61,7 +68,7 @@ def timeline(watcher: Watcher, record: TrackerRecord, now: float, last: int = 6)
         else:
             b = when(end)
         parts.append(f"{watcher.place_name(place)} {a if b == a else f'{a}–{b}'}")
-    return "  ·  ".join(parts)
+    return parts
 
 
 class TrackerModel(QAbstractTableModel):
@@ -214,6 +221,7 @@ class TrackerDelegate(QStyledItemDelegate):
 
 class TrackerTable(QTableView):
     opened = Signal(object)  # TrackerRecord
+    hovered = Signal(object, QPoint)  # the Device under the pointer (None: none, or not heard this session)
 
     def __init__(self, model: TrackerModel, parent=None):
         super().__init__(parent)
@@ -237,13 +245,18 @@ class TrackerTable(QTableView):
         self.hover_row = -1
 
     def mouseMoveEvent(self, event) -> None:
-        row = self.indexAt(event.position().toPoint()).row()
+        index = self.indexAt(event.position().toPoint())
+        record = index.data(RECORD_ROLE) if index.isValid() else None
+        self.hovered.emit(self.model().store.devices.get(record.address) if record else None,
+                          event.globalPosition().toPoint())
+        row = index.row()
         if row != self.hover_row:
             self.hover_row = row
             self.viewport().update()
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event) -> None:
+        self.hovered.emit(None, QPoint())
         self.hover_row = -1
         self.viewport().update()
         super().leaveEvent(event)
@@ -275,7 +288,7 @@ class TrackersPage(QWidget):
         words = QVBoxLayout()
         words.setSpacing(0)
         self.headline = label("", "big")
-        self.detail = label("", "muted")
+        self.detail = ElidedLabel("", "muted")
         words.addWidget(self.headline)
         words.addWidget(self.detail)
         row.addLayout(words, 1)
@@ -287,7 +300,7 @@ class TrackersPage(QWidget):
         self.watch_btn = QPushButton("Watch for  ▾")
         self.watch_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.watch_btn.setToolTip("Which kinds of device to watch. Item trackers are what it's for; the others "
-                                  "only work for devices that keep their Bluetooth address.")
+                                  "work best for devices that keep their Bluetooth address.")
         self.watch_menu = ChecklistMenu(self)
         self.group_actions = {}
         for key, text in GROUPS.items():
@@ -333,6 +346,7 @@ class TrackersPage(QWidget):
         self.model = TrackerModel(watcher, store, self)
         self.table = TrackerTable(self.model)
         self.table.opened.connect(self._open)
+        self.hover = HoverCards(self.table, "Click to find it with its own page", extra=self._card_rows)
         self.empty = label("", "empty")
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty.setWordWrap(True)
@@ -430,7 +444,23 @@ class TrackersPage(QWidget):
         else:
             self.track.emit(device)
 
+    def _card_rows(self, device) -> list[tuple[str, str]]:
+        """The hover card's own rows here: what the watch makes of it."""
+        record = self.watcher.record(device.address)
+        if record is None:
+            return []
+        places = len(record.places)
+        rows = [("Verdict", VERDICTS[record.verdict][0]),
+                ("With you", span_text(record.seen_seconds) + (f", in {places} places" if places > 1 else ""))]
+        parts = timeline_parts(self.watcher, record, time.time(), last=4)
+        return rows + [("Where" if i == 0 else "", part) for i, part in enumerate(parts)]
+
+    def hideEvent(self, event) -> None:
+        self.hover.hide()
+        super().hideEvent(event)
+
     def tick(self, now: float) -> None:
+        self.hover.tick(now)
         c = colors()
         self.model.refresh(now)
         noun = "tracker" if only_trackers(self.watcher) else "device"

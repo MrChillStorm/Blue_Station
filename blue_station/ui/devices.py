@@ -7,17 +7,19 @@ from datetime import datetime
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderView, QLineEdit, QSlider, QStackedLayout, QStyle,
+    QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderView, QLineEdit, QStackedLayout, QStyle,
     QStyledItemDelegate, QTableView, QVBoxLayout, QWidget,
 )
 
 from blue_station.core.baseline import Baseline
 from blue_station.core.decode import short_company
 from blue_station.core.devices import Device, DeviceStore, ago_text, distance_text
+from blue_station.core.links import lead
 from blue_station.ui import icons
 from blue_station.ui.theme import colors
 from blue_station.ui.widgets import (
-    HoverCard, bold, card, dbm, label, link_button, paint_signal, refresh_tool_icons, subtitle, tool_button,
+    ElidedLabel, HoverCard, RangeSlider, bold, card, dbm, label, link_button, paint_signal, refresh_tool_icons,
+    subtitle, tool_button,
 )
 
 PIN, DEVICE, SIGNAL, DISTANCE, SEEN = range(5)
@@ -48,7 +50,7 @@ def matches(device: Device, needle: str) -> bool:
 
 NEAR = -80  # dBm: by default, Nearby only shows devices at least this strong...
 NEAR_SLACK = 4  # ... and keeps them until this much weaker, so a device on the edge doesn't flicker
-NEAR_RANGE = (-100, -40)
+NEAR_RANGE = (-100, -30)  # the high handle at the top: no upper limit
 
 
 class DeviceModel(QAbstractTableModel):
@@ -61,7 +63,8 @@ class DeviceModel(QAbstractTableModel):
         self.show_gone = False
         self.nearby_only = False
         self.baseline: Baseline | None = None  # New only: everything heard before counts as known
-        self.near_dbm = NEAR
+        self.near_dbm = NEAR  # the weakest signal shown...
+        self.near_max = NEAR_RANGE[1]  # ... and the strongest, below the top hiding the very closest ones too
         self._near: set[str] = set()
         self.sort_column, self.sort_order = SIGNAL, Qt.SortOrder.DescendingOrder
         self.frozen = False
@@ -127,8 +130,9 @@ class DeviceModel(QAbstractTableModel):
 
     def near(self, device: Device) -> bool:
         s = device.smoothed
-        near = s is not None and (s >= self.near_dbm or (device.address in self._near
-                                                          and s >= self.near_dbm - NEAR_SLACK))
+        slack = NEAR_SLACK if device.address in self._near else 0  # shown ones stay a little past either end
+        near = s is not None and s >= self.near_dbm - slack and (self.near_max >= NEAR_RANGE[1]
+                                                                or s <= self.near_max + slack)
         if near:
             self._near.add(device.address)
         else:
@@ -137,7 +141,9 @@ class DeviceModel(QAbstractTableModel):
 
     def visible(self) -> list[Device]:
         return [d for d in self.store.devices.values()
-                if (d.pinned or self.show_gone or not d.gone(self.now)) and (not self.needle or matches(d, self.needle))
+                if d.superseded_by is None  # an address it has changed from: the device is listed under its new one
+                and (d.partner is None or lead(d, d.partner) is d)  # one device sending two kinds: listed once
+                and (d.pinned or self.show_gone or not d.gone(self.now)) and (not self.needle or matches(d, self.needle))
                 and (d.pinned or not self.nearby_only or self.near(d))
                 and (d.pinned or self.baseline is None or self.baseline.is_new(d))
                 and (self.predicate is None or self.predicate(d))]
@@ -371,9 +377,10 @@ class HoverCards(QObject):
     """Shows the hover card for whichever device the pointer rests on in a
     table, and keeps it live."""
 
-    def __init__(self, table: DeviceTable, hint: str = "Click to track this device"):
+    def __init__(self, table, hint: str = "Click to track this device", extra=None):
         super().__init__(table)
         self.table = table
+        self.extra = extra  # device -> the page's own rows for the card, or None
         self.card = HoverCard()
         self.card.hint.setText(hint)
         self.device: Device | None = None
@@ -398,7 +405,7 @@ class HoverCards(QObject):
     def _show(self) -> None:
         if self.device is None or not self.table.underMouse():
             return
-        self.card.show_device(self.device, time.time())
+        self.card.show_device(self.device, time.time(), self.extra(self.device) if self.extra else None)
         self.card.place(self._pos)
         self.card.show()
 
@@ -408,7 +415,7 @@ class HoverCards(QObject):
 
     def tick(self, now: float) -> None:
         if self.card.isVisible() and self.device is not None:
-            self.card.show_device(self.device, now)
+            self.card.show_device(self.device, now, self.extra(self.device) if self.extra else None)
 
 
 class DevicesPage(QWidget):
@@ -457,7 +464,7 @@ class DevicesPage(QWidget):
         numbers = QVBoxLayout()
         numbers.setSpacing(0)
         self.count = label("0 devices", "big")
-        self.detail = label("", "muted")
+        self.detail = ElidedLabel("", "muted")
         numbers.addWidget(self.count)
         numbers.addWidget(self.detail)
         row.addLayout(numbers, 1)
@@ -470,20 +477,20 @@ class DevicesPage(QWidget):
         self.search.addAction(icons.icon("search", colors()["faint"], 16), QLineEdit.ActionPosition.LeadingPosition)
         self.search.textChanged.connect(self._filter)
         self.nearby = QCheckBox("Nearby only")
-        self.nearby.setToolTip("Hide devices weaker than the signal set beside it. Pinned devices stay.")
+        self.nearby.setToolTip("Show only devices whose signal is within the range set beside it. Pinned devices "
+                               "stay.")
         self.nearby.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.nearby.toggled.connect(self._toggle_nearby)
-        self.near_slider = QSlider(Qt.Orientation.Horizontal)
-        self.near_slider.setRange(*NEAR_RANGE)
-        self.near_slider.setPageStep(5)
-        self.near_slider.setValue(NEAR)
-        self.near_slider.setFixedWidth(96)
-        self.near_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.near_slider.setToolTip("How strong a device has to be to count as nearby. Roughly: −60 dBm is close "
-                                    "by in the same room, −80 the next room, −90 and weaker far away.")
-        self.near_slider.valueChanged.connect(self._set_near)
-        self.near_value = label(f"{dbm(NEAR)} dBm", "muted")
-        self.near_value.setFixedWidth(self.near_value.fontMetrics().horizontalAdvance(f"{dbm(-100)} dBm") + 4)
+        self.near_slider = RangeSlider(*NEAR_RANGE, NEAR, NEAR_RANGE[1])
+        self.near_slider.setFixedWidth(110)
+        self.near_slider.setToolTip("The left handle is the weakest signal shown, the right one the strongest. "
+                                    "Roughly: −60 dBm is close by in the same room, −80 the next room, −90 and weaker "
+                                    "far away. Below the top, the right handle also hides devices right next to "
+                                    "you, like your own.")
+        self.near_slider.valuesChanged.connect(self._set_near)
+        self.near_value = label(self.near_text(), "muted")
+        self.near_value.setFixedWidth(self.near_value.fontMetrics().horizontalAdvance(
+            f"{dbm(-100)} to {dbm(-100)} dBm") + 4)
         self.near_slider.setEnabled(False)
         self.near_value.setEnabled(False)
         self.gone = QCheckBox("Show out of range")
@@ -495,7 +502,8 @@ class DevicesPage(QWidget):
         self.new_only = QCheckBox("New only")
         self.new_only.setToolTip("Everything heard so far counts as known, and the list shows only devices that "
                                  "turn up after that. Phones and earbuds change their address every 15 minutes "
-                                 "or so and then look new, unless they advertise a name already known.")
+                                 "or so: when Blue Station hears the change happen, or they advertise a name "
+                                 "already known, they stay known. Otherwise they look new.")
         self.new_only.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.new_only.toggled.connect(self._toggle_new)
         self.new_bell = tool_button("bell", "A notification when a new device turns up (a near one, with Nearby "
@@ -578,10 +586,14 @@ class DevicesPage(QWidget):
         self.near_value.setEnabled(on)
         self.model.refresh(time.time(), force=True)
 
-    def _set_near(self, value: int) -> None:
-        self.model.near_dbm = value
+    def near_text(self) -> str:
+        low, high = self.near_slider.values()
+        return f"{dbm(low)} dBm and up" if high >= NEAR_RANGE[1] else f"{dbm(low)} to {dbm(high)} dBm"
+
+    def _set_near(self, low: int, high: int) -> None:
+        self.model.near_dbm, self.model.near_max = low, high
         self.model._near.clear()  # the slack is for flicker at one setting, not across settings
-        self.near_value.setText(f"{dbm(value)} dBm")
+        self.near_value.setText(self.near_text())
         self.model.refresh(time.time(), force=True)
 
     def clear(self) -> None:
@@ -621,7 +633,7 @@ class DevicesPage(QWidget):
             parts.append(f"{pinned} pinned")
         far = sum(1 for d in in_range if not d.pinned and not self.model.near(d)) if self.model.nearby_only else 0
         if far:
-            parts.append(f"{far} weaker than {dbm(self.model.near_dbm)} dBm hidden")
+            parts.insert(0, f"{far} hidden by Nearby only")  # before the rest: it explains the list
         if len(self.model.rows) != len(in_range) and self.model.needle:
             parts.insert(0, f"{len(self.model.rows)} match the filter")
         baseline = self.model.baseline
@@ -641,8 +653,8 @@ class DevicesPage(QWidget):
                 text = (f"Nothing new since {datetime.fromtimestamp(baseline.since):%H:%M}. Devices that turn up "
                         "from now on show up here.")
             elif far:
-                text = (f"Nothing at {dbm(self.model.near_dbm)} dBm or stronger. Move the slider left, or turn off "
-                        f"Nearby only, to see the {far} weaker ones.")
+                text = (f"Nothing at {self.near_text()}. Widen the range, or turn off Nearby only, to see the "
+                        f"{far} outside it.")
             elif state == "starting":
                 text = "Starting the scan…  If macOS asks whether Blue Station may use Bluetooth, allow it."
             elif state == "scanning":

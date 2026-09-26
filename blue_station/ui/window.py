@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 
 from blue_station.core import login, names, prefs
 from blue_station.core.alerts import GONE, Alerts
+from blue_station.core.links import Linker
 from blue_station.core.devices import Device, DeviceStore, span_text
 from blue_station.core.packets import PacketLog
 from blue_station.core.watch import DEFAULT_GROUPS, FOLLOWING, GROUPS, Watcher
@@ -104,6 +105,7 @@ class MainWindow(QMainWindow):
         self.watcher = Watcher(scanner.watch_history(time.time()) if demo else prefs.load(prefs.TRACKERS), groups)
         self.log = PacketLog()
         self.alerts = Alerts()
+        self.linker = Linker(None if demo else self.settings.get("learned_bytes"))
         self.menubar: MenuBar | None = None
         self._quitting = False
         self._hidden_at: float | None = None  # when it was closed to the menu bar
@@ -149,7 +151,9 @@ class MainWindow(QMainWindow):
         self._shortcuts()
 
         self.devices.gone.setChecked(bool(self.settings.get("show_gone")))
-        self.devices.near_slider.setValue(int(self.settings.get("nearby_dbm", self.devices.near_slider.value())))
+        low, high = self.devices.near_slider.values()
+        self.devices.near_slider.setValues(int(self.settings.get("nearby_dbm", low)),
+                                           int(self.settings.get("nearby_max", high)))
         self.devices.nearby.setChecked(bool(self.settings.get("nearby_only")))
         self.trackers.gone.setChecked(bool(self.settings.get("trackers_show_gone")))
         geometry = self.settings.get("geometry")
@@ -319,6 +323,8 @@ class MainWindow(QMainWindow):
             self.store.ingest(sightings)
             self.log.add(sightings)
         devices = list(self.store.devices.values())
+        for old, new, sure in self.linker.update(now, devices):
+            self._hand_over(old, new, sure)
         for record in self.watcher.update(now, devices):
             self._alert(record)
         for device, what in self.alerts.update(now, devices, self.scanner.state == "scanning"):
@@ -363,6 +369,18 @@ class MainWindow(QMainWindow):
         if not self.demo and QGuiApplication.platformName() != "offscreen":
             notify("Blue Station", text, URGENT)
         self._save_watch()
+
+    def _hand_over(self, old: Device, new: Device, sure: float) -> None:
+        """A device changed its Bluetooth address: everything about it
+        carries on under the new one."""
+        self.store.hand_over(old, new, sure)
+        self.watcher.hand_over(old.address, new.address)
+        self.alerts.hand_over(old.address, new.address)
+        if not self.demo and new.address in self.store.known:
+            self.settings["known"] = self.store.known
+            self._save()
+        if self.on_page(self.track) and self.track.device is old:
+            self.track.show_device(new)  # the page follows the device
 
     def _device_alert(self, device: Device, what: str) -> None:
         """One you asked for on the device's page: out of range, or back."""
@@ -549,7 +567,7 @@ class MainWindow(QMainWindow):
 
     def hide_to_menu_bar(self, tell: bool = True) -> None:
         """The window goes; the watching stays."""
-        for page in (self.devices, self.survey, self.develop):
+        for page in (self.devices, self.trackers, self.survey, self.develop):
             page.hover.hide()
         self.develop.disconnect()  # no need to keep a device connected for nobody
         if self.isVisible():  # started at login, it never was: keep the window's last size and place
@@ -618,11 +636,12 @@ class MainWindow(QMainWindow):
         self.settings["geometry"] = bytes(self.saveGeometry().toBase64()).decode()
         self.settings["show_gone"] = self.devices.gone.isChecked()
         self.settings["nearby_only"] = self.devices.nearby.isChecked()
-        self.settings["nearby_dbm"] = self.devices.near_slider.value()
+        self.settings["nearby_dbm"], self.settings["nearby_max"] = self.devices.near_slider.values()
         self.settings["trackers_show_gone"] = self.trackers.gone.isChecked()
         self.settings["job"] = self.job
         if not self.demo:
             self.settings["known"] = self.store.known
+            self.settings["learned_bytes"] = self.linker.to_dict()
         self._save()
         self._save_watch()
 
@@ -632,7 +651,7 @@ class MainWindow(QMainWindow):
             self.hide_to_menu_bar()
             return
         self.timer.stop()
-        for page in (self.devices, self.survey, self.develop):
+        for page in (self.devices, self.trackers, self.survey, self.develop):
             page.hover.hide()
         self.develop.disconnect()
         self._keep_settings()
