@@ -2,6 +2,7 @@
 details on hover, a click to track one. The order holds still while the
 pointer is over the list, so a row never jumps out from under a click."""
 import time
+from datetime import datetime
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -10,11 +11,14 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate, QTableView, QVBoxLayout, QWidget,
 )
 
+from blue_station.core.baseline import Baseline
 from blue_station.core.decode import short_company
 from blue_station.core.devices import Device, DeviceStore, ago_text, distance_text
 from blue_station.ui import icons
 from blue_station.ui.theme import colors
-from blue_station.ui.widgets import HoverCard, bold, card, dbm, label, link_button, paint_signal, subtitle
+from blue_station.ui.widgets import (
+    HoverCard, bold, card, dbm, label, link_button, paint_signal, refresh_tool_icons, subtitle, tool_button,
+)
 
 PIN, DEVICE, SIGNAL, DISTANCE, SEEN = range(5)
 HEADERS = ["", "DEVICE", "SIGNAL", "DISTANCE", "LAST SEEN"]
@@ -23,10 +27,23 @@ RESORT_EVERY = 2.0  # seconds; a list re-sorted on every packet would never sit 
 NEW_FOR = 10.0  # seconds a new device wears its NEW badge
 
 
+def text_matches(haystack: str, needle: str) -> bool:
+    """Every word must be there, except a word with a minus in front
+    (-apple), which must not."""
+    haystack = haystack.lower()
+    for word in needle.lower().split():
+        if word.startswith("-") and len(word) > 1:
+            if word[1:] in haystack:
+                return False
+        elif word not in haystack:
+            return False
+    return True
+
+
 def matches(device: Device, needle: str) -> bool:
     haystack = " ".join(filter(None, [device.title, device.name, device.info.kind, device.info.vendor,
                                       short_company(device.info.vendor), device.address, device.mac]))
-    return all(word in haystack.lower() for word in needle.lower().split())
+    return text_matches(haystack, needle)
 
 
 NEAR = -80  # dBm: by default, Nearby only shows devices at least this strong...
@@ -43,6 +60,7 @@ class DeviceModel(QAbstractTableModel):
         self.needle = ""
         self.show_gone = False
         self.nearby_only = False
+        self.baseline: Baseline | None = None  # New only: everything heard before counts as known
         self.near_dbm = NEAR
         self._near: set[str] = set()
         self.sort_column, self.sort_order = SIGNAL, Qt.SortOrder.DescendingOrder
@@ -121,6 +139,7 @@ class DeviceModel(QAbstractTableModel):
         return [d for d in self.store.devices.values()
                 if (d.pinned or self.show_gone or not d.gone(self.now)) and (not self.needle or matches(d, self.needle))
                 and (d.pinned or not self.nearby_only or self.near(d))
+                and (d.pinned or self.baseline is None or self.baseline.is_new(d))
                 and (self.predicate is None or self.predicate(d))]
 
     def refresh(self, now: float, force: bool = False) -> None:
@@ -444,7 +463,8 @@ class DevicesPage(QWidget):
         row.addLayout(numbers, 1)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Filter devices   ⌘F")
-        self.search.setToolTip("Matches names, kinds, makers and addresses")
+        self.search.setToolTip("Matches names, kinds, makers and addresses. A minus leaves out what matches: "
+                               "-apple -tv")
         self.search.setClearButtonEnabled(True)
         self.search.setMinimumWidth(220)
         self.search.addAction(icons.icon("search", colors()["faint"], 16), QLineEdit.ActionPosition.LeadingPosition)
@@ -472,13 +492,43 @@ class DevicesPage(QWidget):
         self.gone.toggled.connect(self._toggle_gone)
         self.clear_btn = link_button("Clear", "Forget the devices heard so far (pinned ones stay)")
         self.clear_btn.clicked.connect(self.clear)
-        row.addWidget(self.search)
-        row.addWidget(self.nearby)
-        row.addSpacing(-6)
-        row.addWidget(self.near_slider)
-        row.addWidget(self.near_value)
-        row.addWidget(self.gone)
-        row.addWidget(self.clear_btn)
+        self.new_only = QCheckBox("New only")
+        self.new_only.setToolTip("Everything heard so far counts as known, and the list shows only devices that "
+                                 "turn up after that. Phones and earbuds change their address every 15 minutes "
+                                 "or so and then look new, unless they advertise a name already known.")
+        self.new_only.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.new_only.toggled.connect(self._toggle_new)
+        self.new_bell = tool_button("bell", "A notification when a new device turns up (a near one, with Nearby "
+                                            "only), also from the menu bar", 18)
+        self.new_bell.setCheckable(True)
+        self.new_bell.toggled.connect(self._toggle_new_bell)
+        self.new_reset = link_button("Reset", "Start over: everything heard so far counts as known")
+        self.new_reset.clicked.connect(self.reset_baseline)
+        for w in (self.new_bell, self.new_reset):
+            w.setEnabled(False)  # until New only is on; shown anyway, so nothing moves when it is
+
+        controls = QVBoxLayout()
+        controls.setSpacing(6)
+        top = QHBoxLayout()
+        top.setSpacing(14)
+        top.addWidget(self.search, 1)
+        top.addWidget(self.clear_btn)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(14)
+        bottom.addStretch(1)
+        new_group = QHBoxLayout()
+        new_group.setSpacing(2)
+        for w in (self.new_only, self.new_bell, self.new_reset):
+            new_group.addWidget(w)
+        bottom.addLayout(new_group)
+        bottom.addWidget(self.nearby)
+        bottom.addSpacing(-6)
+        bottom.addWidget(self.near_slider)
+        bottom.addWidget(self.near_value)
+        bottom.addWidget(self.gone)
+        controls.addLayout(top)
+        controls.addLayout(bottom)
+        row.addLayout(controls)
         return frame
 
     # ---- actions ----------------------------------------------------------------------
@@ -486,6 +536,37 @@ class DevicesPage(QWidget):
     def _filter(self, text: str) -> None:
         self.model.needle = text.strip()
         self.model.refresh(time.time(), force=True)
+
+    def _toggle_new(self, on: bool) -> None:
+        self.model.baseline = Baseline(time.time(), self.store.devices.values()) if on else None
+        self.new_reset.setEnabled(on)
+        self.new_bell.setEnabled(on)
+        if not on:
+            self.new_bell.setChecked(False)
+        self.model.refresh(time.time(), force=True)
+        if on:
+            self.message.emit(f"New only: the {len(self.store.devices)} devices heard so far count as known.")
+
+    def reset_baseline(self) -> None:
+        if self.new_only.isChecked():
+            self._toggle_new(True)
+
+    def _toggle_new_bell(self, on: bool) -> None:
+        refresh_tool_icons(self.new_bell, color_key="accent" if on else "muted")
+        if not self.new_only.isChecked():
+            return
+        self.message.emit("You'll get a notification when a new device turns up." if on
+                          else "No notifications for new devices.")
+
+    def arrivals(self, now: float) -> list[Device]:
+        """New devices to announce, each once, when New only's bell is on.
+        Checked every tick, so it works from the menu bar too."""
+        baseline = self.model.baseline
+        if baseline is None:
+            return []
+        due = baseline.arrivals(now, list(self.store.devices.values()),
+                                self.model.near if self.model.nearby_only else None)
+        return due if self.new_bell.isChecked() else []  # noticed either way, so turning it on doesn't flood
 
     def _toggle_gone(self, on: bool) -> None:
         self.model.show_gone = on
@@ -543,6 +624,10 @@ class DevicesPage(QWidget):
             parts.append(f"{far} weaker than {dbm(self.model.near_dbm)} dBm hidden")
         if len(self.model.rows) != len(in_range) and self.model.needle:
             parts.insert(0, f"{len(self.model.rows)} match the filter")
+        baseline = self.model.baseline
+        if baseline is not None:
+            since = datetime.fromtimestamp(baseline.since).strftime("%H:%M")
+            parts.insert(0, f"{baseline.count_new(devices, now)} new since {since}")
         self.detail.setText("  ·  ".join(parts) or "Nothing heard yet")
 
         if self.model.rows:
@@ -552,6 +637,9 @@ class DevicesPage(QWidget):
                 text = error
             elif self.model.needle:
                 text = "No device matches the filter."
+            elif baseline is not None:
+                text = (f"Nothing new since {datetime.fromtimestamp(baseline.since):%H:%M}. Devices that turn up "
+                        "from now on show up here.")
             elif far:
                 text = (f"Nothing at {dbm(self.model.near_dbm)} dBm or stronger. Move the slider left, or turn off "
                         f"Nearby only, to see the {far} weaker ones.")

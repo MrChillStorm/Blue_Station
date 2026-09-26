@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blue-station"
-version = "1.2.0"
+version = "1.3.0"
 description = "A live Bluetooth Low Energy scanner: every device nearby with its signal, and a page to track one."
 readme = "README.md"
 license = "MIT"

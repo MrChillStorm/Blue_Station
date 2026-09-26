@@ -186,6 +186,8 @@ class DevelopPage(QWidget):
         box.setSpacing(8)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Filter devices")
+        self.search.setToolTip("Matches names, kinds, makers and addresses. A minus leaves out what matches: "
+                               "-apple -tv")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._filter)
         search_row = QHBoxLayout()

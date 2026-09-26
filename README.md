@@ -4,9 +4,10 @@ A live Bluetooth Low Energy scanner, with one page per job. Pick the job
 at the top and you get only what that job needs:
 
 - **Scan**: every device around you, each with a live signal bar and
-  the number beside it. Hover a device for its details.
+  the number beside it. Hover a device for its details, or narrow the
+  list to the near ones, or to the ones that just turned up.
 - **Trackers**: AirTags and other item trackers, and whether one is
-  following you.
+  following you, with where and when it was with you.
 - **Survey**: check that beacons are alive, and map coverage on a floor
   plan.
 - **Develop**: one device, the way its firmware's author sees it:
@@ -38,7 +39,7 @@ blue-station
 
 `pipx upgrade blue-station` gets each new release. To install one
 particular version instead, add its tag to the end, like
-`Blue_Station.git@v1.1.0`. pipx then keeps that version, and
+`Blue_Station.git@v1.3.0`. pipx then keeps that version, and
 `pipx upgrade` won't move it.
 
 `blue-station --demo` fills the room with made-up devices, a made-up
@@ -73,15 +74,15 @@ Ctrl), but only macOS has been tried.
 ## In the menu bar
 
 Closing the window doesn't quit. Blue Station keeps watching for
-trackers and for your alerts behind a small icon in the menu bar (the
-app icon's rounded square with the waves cut out). A red badge on the
-icon counts the devices that may be following you. Clicking Blue
-Station in the Dock opens the window again.
+trackers, your alerts and new devices behind a small icon in the menu
+bar: the app icon's rounded square with the waves cut out. A red badge
+on it counts the devices that may be following you. Its menu opens the
+window again, pauses scanning, and quits (so does ⌘Q). Clicking Blue
+Station in the Dock, or starting it again, also brings the window back.
+**Keep watching in the menu bar** in the gear menu turns this off.
+
 When the menu bar is full, or on a display with a notch, macOS hides
-the icons that don't fit. Its menu opens the window again, pauses scanning, and
-quits, and so does ⌘Q. Starting Blue Station again while it's there
-brings the window back. **Keep watching in the menu bar** in the gear
-menu turns this off.
+the icons that don't fit.
 
 **Start at login**, in either menu, starts Blue Station in the menu bar
 when you log in (macOS). It adds a LaunchAgent
@@ -111,6 +112,20 @@ Everything heard in the last 30 seconds, strongest first.
   slider beside it, for busy places: roughly −60 dBm is close by in the
   same room, −80 (where it starts) the next room, and −90 and weaker
   far away. Pinned devices stay.
+- **New only** takes a baseline: everything heard so far counts as
+  known, and the list shows only devices that turn up after that, like
+  something just brought into the room. Its **bell** sends a
+  notification with a sound for each one, even from the menu bar, and
+  with Nearby only on, only for the near ones. **Reset** takes a fresh
+  baseline. Phones, AirPods and watches change their address every 15
+  minutes or so and then look new, unless they advertise a name that's
+  already known, so it works best for a short watch or for devices that
+  keep their address.
+
+**The filter** (⌘F) matches names, kinds, makers and addresses. A
+minus in front of a word leaves out what matches: `-apple -tv` hides
+Apple devices and TVs, and `sensor -thermo` shows sensors but not the
+thermometer. The Trackers and Develop filters work the same way.
 
 **Hover** a device for its card: the last minute of signal as a
 sparkline, packets per second, the address, services and anything
@@ -135,9 +150,9 @@ top, and Blue Station remembers it.
 - **The speaker button** beeps while you search: faster, and a little
   higher, as the signal gets stronger. Walk towards the faster beeps and
   look at the room instead of the screen.
-- **The bell** sends a notification when the device goes out of range
-  (did you leave your bag behind?) or comes back in range. Only
-  scanning counts: pausing, Bluetooth going off or the Mac sleeping
+- **The bell** sends a notification with a sound when the device goes
+  out of range (did you leave your bag behind?) or comes back in range.
+  Only scanning counts: pausing, Bluetooth going off or the Mac sleeping
   isn't the device leaving, and one on the edge of range alerts at most
   every 5 minutes.
 - The **pencil** gives it a name of your own, and **Export** saves its
@@ -154,8 +169,8 @@ how long it has been with you, in how many places, and a verdict:
 neighbour's tag) or **Following you**.
 
 - **Following you** means it has been with you in two different places.
-  Then the job button turns red, the status bar says so, and macOS
-  shows a notification. Click the tracker to find it with its own page.
+  Then the job button and the menu bar icon turn red, and a notification
+  with a sound says so. Click the tracker to find it with its own page.
 - **Places without GPS.** A laptop has no GPS, so Blue Station
   recognizes places by their **landmarks**: named devices that stay put,
   like TVs, printers and speakers. When most of the landmarks around you
@@ -168,12 +183,6 @@ neighbour's tag) or **Following you**.
 - While you're between places, nothing is credited to a place. So a
   stranger's tag at a café can't be blamed on your home before the café
   is recognized.
-- **Out of range** trackers (not heard for 30 seconds) are left out,
-  unless they may be following you. **Show out of range** lists them
-  all.
-- **The filter** (⌘F) finds trackers by name, kind, maker or address,
-  like the Scan page's, and also by verdict and by the places they were
-  with you.
 - **It watches in the background**, whichever job is on screen and
   from the menu bar after you close the window. It remembers what it
   has seen across restarts: trackers for 48 hours (AirTags away from
@@ -185,6 +194,12 @@ neighbour's tag) or **Following you**.
   9:10–now*, and pointing at its number of places shows the same.
   *Unknown place* is time with you before a place was recognized, or on
   the way between places.
+- **Out of range** trackers (not heard for 30 seconds) are left out,
+  unless they may be following you. **Show out of range** lists them
+  all.
+- **The filter** (⌘F) finds trackers by name, kind, maker or address,
+  like the Scan page's, and also by verdict and by the places they were
+  with you.
 - **Watch for** adds other kinds of device: headphones and earbuds,
   watches, bands and health devices, phones and tablets, or anything
   else that could travel. TVs, speakers and beacons stay put, so they're
@@ -240,8 +255,14 @@ Pick a device on the left.
 - **GATT**: **Connect** and stay connected. Browse every service,
   **Read** any characteristic, and **Follow** notifications live.
   Heart rate, battery, temperature and other standard values are
-  decoded, and everything else shows as hex. Reading a protected
-  characteristic may make macOS ask to pair.
+  decoded, and everything else shows as hex. Follow turns into Stop
+  only once the device agrees, and a refusal or the device hanging up
+  shows in the notifications box. A value that only changes now and
+  then (a battery) can take a long while to send anything.
+- **Pairing.** Reading or following a protected characteristic makes
+  macOS ask to pair, with a code to confirm on both sides. Many devices
+  answer only while they're ready for it: a watch, for example, when
+  you've turned on its heart rate sharing.
 
 ## Good to know
 
@@ -257,6 +278,9 @@ Pick a device on the left.
 - macOS shows each device under an address of its own making (a UUID
   that's the same only on your Mac). Where it can, Blue Station also
   shows the real Bluetooth address.
+- Blue Station's notifications (trackers, alerts, new devices) come
+  through macOS as Script Editor's, so their sound and banner settings
+  are under Script Editor in System Settings → Notifications.
 - The AirPods, Find My, Apple activity and Windows readings come from
   community research, not from published specifications. They are good
   hints, not guarantees. The same goes for the tracker verdicts. A
@@ -281,15 +305,17 @@ the system), **Keep watching in the menu bar**, **Start at login**,
 ## Your data
 
 Nothing is recorded unless you export it, except two small files kept in
-your system's usual place for app data:
+your system's usual place for app data (and, with **Start at login**,
+the LaunchAgent and small app described under *In the menu bar*):
 
 - `settings.json`: settings, and the names, pins, calibrations and
   alerts you give devices.
 - `trackers.json`: the tracker watch's memory, meaning which trackers
   it has seen and when, which devices you said are yours, and your
   places: their landmarks (the per-Mac IDs of named devices) and the
-  names you give them. Nothing else about where you are. **Forget history…** in the Trackers page's Watch for menu empties it,
-  except for which devices are yours.
+  names you give them. Nothing else about where you are. **Forget
+  history…** in the Trackers page's Watch for menu empties it, except
+  for which devices are yours.
 
 | System | Folder |
 |---|---|
@@ -314,6 +340,7 @@ python3 packaging/build_icon.py      # rebuild the app icon after editing packag
   - `decode.py`: what an advertisement says (kinds, makers, beacons, Apple, Microsoft...)
   - `watch.py`: trackers, places and landmarks, and each device's timeline
   - `alerts.py`: out of range and back again, for the devices you asked about
+  - `baseline.py`: New only's baseline, and which devices are new
   - `survey.py`: survey points and the map's estimate
   - `packets.py`: the packet log
   - `gatt.py`: the quick read, and the lasting connection with notifications

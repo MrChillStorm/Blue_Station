@@ -84,6 +84,12 @@ class DevicesTest(WindowCase):
         self.assertEqual([d.name for d in page.model.rows], ["Fitness Band"])
         page.search.setText("apple")
         self.assertTrue(all("Apple" in (d.info.vendor or "") for d in page.model.rows))
+        page.search.setText("-apple -tv")  # a minus leaves out what matches
+        names = [d.title for d in page.model.rows]
+        self.assertTrue(names and not any("Apple" in (d.info.vendor or "") for d in page.model.rows))
+        self.assertNotIn("Living Room TV", names)
+        page.search.setText("sensor -thermo")
+        self.assertEqual({d.name for d in page.model.rows}, {"Bike Sensor", "Fitness Band"})  # a heart rate sensor
         page.search.setText("nothing like this")
         self.window.tick()
         self.assertEqual(page.model.rows, [])
@@ -151,6 +157,30 @@ class DevicesTest(WindowCase):
         self.window.close()
         self.assertTrue(prefs.load()["nearby_only"])
         self.assertEqual(prefs.load()["nearby_dbm"], -55)
+
+    def test_new_only(self):
+        page = self.window.devices
+        pinned = self.device("Desk Keyboard")
+        page.table.pinToggled.emit(pinned)
+        page.new_only.setChecked(True)
+        self.window.tick()
+        self.assertEqual(page.model.rows, [pinned])  # everything else is known; pinned ones stay
+        self.assertTrue(page.new_reset.isEnabled() and page.new_bell.isEnabled())
+        self.assertIn("0 new since", page.detail.text())
+        page.new_bell.setChecked(True)
+        now = time.time()
+        self.window.store.ingest([Sighting("NEWCOMER", -58, now - 5 + i) for i in range(6)])
+        self.window.tick()
+        self.assertIn("NEWCOMER", [d.address for d in page.model.rows])
+        self.assertIn("1 new since", page.detail.text())
+        self.assertIn("New device", self.window.statusBar().currentMessage())
+        page.new_reset.click()  # start over: the newcomer is known now
+        self.window.tick()
+        self.assertNotIn("NEWCOMER", [d.address for d in page.model.rows])
+        page.new_only.setChecked(False)
+        self.assertGreater(len(page.model.rows), 5)
+        self.assertFalse(page.new_bell.isChecked())
+        self.assertFalse(page.new_bell.isEnabled())
 
     def test_hover_card(self):
         page = self.window.devices
@@ -231,6 +261,14 @@ class TrackTest(WindowCase):
         self.assertIn("back in range", self.window.statusBar().currentMessage())
         self.window.devices.clear()
         self.assertIn(device.address, self.window.store.devices)  # kept, or it would seem to arrive again
+
+    def test_alerts_come_with_a_sound(self):
+        from blue_station.ui.window import GENTLE, URGENT, notification_script
+        self.assertTrue(notification_script("Blue Station", "Bag is out of range.", URGENT)
+                        .endswith(f'sound name "{URGENT}"'))
+        self.assertNotIn("sound", notification_script("Blue Station", "Still watching."))
+        for sound in (URGENT, GENTLE):  # macOS's own sounds, there on every Mac
+            self.assertTrue(Path(f"/System/Library/Sounds/{sound}.aiff").exists() or sys.platform != "darwin")
 
     def test_rename_calibrate_and_remember(self):
         device = self.open("Desk Keyboard")
@@ -331,6 +369,9 @@ class TrackersJobTest(WindowCase):
         self.window.tick()
         self.assertEqual([r.kind for r in page.model.rows], ["Tile tracker"])
         self.assertIn("1 match the filter", page.detail.text())
+        page.search.setText("-tile")
+        self.window.tick()
+        self.assertNotIn("Tile tracker", [r.kind for r in page.model.rows])
         page.search.setText("passing")  # verdicts match too
         self.window.tick()
         self.assertTrue(page.model.rows and all(r.verdict == "passing" for r in page.model.rows))

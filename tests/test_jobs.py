@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from blue_station.core import gatt, login
 from blue_station.core.alerts import BACK, GONE, Alerts
+from blue_station.core.baseline import Baseline
 from blue_station.core.devices import Device, DeviceStore, Sighting, gap_stats
 from blue_station.core.packets import PacketLog
 from blue_station.core.scanner import Scanner
@@ -253,6 +254,29 @@ class AlertsTest(unittest.TestCase):
         self.seconds(0, 60, ["BAG"])
         due = self.seconds(60, 100, []) + self.seconds(100, 110, ["BAG"]) + self.seconds(110, 150, [])
         self.assertEqual(due, [("BAG", GONE), ("BAG", BACK)])  # the second GONE waits out the cooldown
+
+
+class BaselineTest(unittest.TestCase):
+    def test_only_what_turns_up_afterwards_is_new(self):
+        store = DeviceStore()
+        store.ingest([Sighting("KEYBOARD", -50, 0, name="Desk Keyboard"), Sighting("TAG", -80, 0)])
+        baseline = Baseline(10, store.devices.values())
+        store.ingest([Sighting("STRANGER", -60, 20),
+                      Sighting("KEYBOARD-2", -50, 20, name=" desk keyboard ")])  # a known name, a new address
+        new = [d.address for d in store.devices.values() if baseline.is_new(d)]
+        self.assertEqual(new, ["STRANGER"])
+        self.assertEqual(baseline.count_new(store.devices.values(), 21), 1)
+        self.assertEqual(baseline.count_new(store.devices.values(), 60), 0)  # out of range by then
+
+    def test_arrivals_are_announced_once_and_near_enough(self):
+        store = DeviceStore()
+        baseline = Baseline(0, [])
+        store.ingest([Sighting("CLOSE", -55, t) for t in (10, 11, 14)] + [Sighting("FAR", -92, t) for t in (10, 14)])
+        devices = list(store.devices.values())
+        self.assertEqual(baseline.arrivals(11, devices), [])  # heard for a moment: its name may still come
+        near = lambda d: d.smoothed >= -80
+        self.assertEqual([d.address for d in baseline.arrivals(14, devices, near)], ["CLOSE"])
+        self.assertEqual(baseline.arrivals(15, devices, near), [])  # once
 
 
 class LoginTest(unittest.TestCase):

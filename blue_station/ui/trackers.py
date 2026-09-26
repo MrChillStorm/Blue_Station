@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 from blue_station.core.decode import short_company
 from blue_station.core.devices import DeviceStore, ago_text, span_text
 from blue_station.core.watch import FOLLOWING, GROUPS, HEARD_WITHIN, STAYING, TrackerRecord, Watcher
+from blue_station.ui.devices import text_matches
 from blue_station.ui import icons
 from blue_station.ui.theme import colors
 from blue_station.ui.widgets import ChecklistMenu, bold, card, dbm, label, link_button, paint_signal, subtitle, when
@@ -117,8 +118,7 @@ class TrackerModel(QAbstractTableModel):
         if d is not None:
             words += [d.title, d.name, d.info.vendor, short_company(d.info.vendor), d.mac]
         words += [self.watcher.place_name(v[0]) for v in record.visits]
-        haystack = " ".join(filter(None, words)).lower()
-        return all(word in haystack for word in self.needle.lower().split())
+        return text_matches(" ".join(filter(None, words)), self.needle)
 
     def refresh(self, now: float) -> None:
         self.now = now
@@ -306,7 +306,8 @@ class TrackersPage(QWidget):
         self.search = QLineEdit()
         self.search.setClearButtonEnabled(True)
         self.search.setMinimumWidth(180)
-        self.search.setToolTip("Matches names, kinds, makers, addresses, verdicts and places")
+        self.search.setToolTip("Matches names, kinds, makers, addresses, verdicts and places. A minus leaves out "
+                               "what matches: -passing")
         self.search.addAction(icons.icon("search", colors()["faint"], 16), QLineEdit.ActionPosition.LeadingPosition)
         self.search.textChanged.connect(self._filter)
         self.name_btn = link_button("Name this place", "Call the place you're at something of your own, like Home. "

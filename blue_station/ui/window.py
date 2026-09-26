@@ -31,7 +31,7 @@ from blue_station.ui.menubar import MenuBar
 from blue_station.ui.survey import SurveyPage
 from blue_station.ui.track import TrackPage
 from blue_station.ui.trackers import TrackersPage, timeline
-from blue_station.ui.widgets import ScanIndicator, Segmented, refresh_tool_icons, tool_button
+from blue_station.ui.widgets import ScanIndicator, Segmented, dbm, refresh_tool_icons, tool_button
 
 SCAN, TRACKERS, SURVEY, DEVELOP = range(4)
 JOBS = ["Scan", "Trackers", "Survey", "Develop"]
@@ -72,12 +72,21 @@ can show up as several devices over time.</p>
 </table>"""
 
 
-def notify(title: str, text: str) -> None:
+URGENT, GENTLE, NOTICE = "Sosumi", "Glass", "Ping"  # macOS sounds: left behind or followed; back; new
+
+
+def notification_script(title: str, text: str, sound: str | None = None) -> str:
+    script = f"display notification {json.dumps(text, ensure_ascii=False)} with title " \
+             f"{json.dumps(title, ensure_ascii=False)}"
+    return script + (f" sound name {json.dumps(sound)}" if sound else "")
+
+
+def notify(title: str, text: str, sound: str | None = None) -> None:
     """A system notification, for alerts that matter while the window is
-    in the background."""
+    in the background, with one of macOS's own sounds if given. macOS
+    files these under Script Editor in its notification settings."""
     if sys.platform == "darwin":
-        script = f"display notification {json.dumps(text, ensure_ascii=False)} with title " \
-                 f"{json.dumps(title, ensure_ascii=False)}"
+        script = notification_script(title, text, sound)
         try:
             subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
@@ -314,6 +323,8 @@ class MainWindow(QMainWindow):
             self._alert(record)
         for device, what in self.alerts.update(now, devices, self.scanner.state == "scanning"):
             self._device_alert(device, what)
+        for device in self.devices.arrivals(now):
+            self._new_device_alert(device)
         if not self.demo and now - self._watch_saved >= SAVE_WATCH_EVERY:
             self._save_watch()
         if self.survey.survey.update(now, devices):
@@ -350,7 +361,7 @@ class MainWindow(QMainWindow):
         text = f"A {record.kind} may be following you: it has been with you in {places} different places."
         self._status(text)
         if not self.demo and QGuiApplication.platformName() != "offscreen":
-            notify("Blue Station", text)
+            notify("Blue Station", text, URGENT)
         self._save_watch()
 
     def _device_alert(self, device: Device, what: str) -> None:
@@ -359,7 +370,14 @@ class MainWindow(QMainWindow):
                 else f"{device.title} is back in range.")
         self._status(text)
         if QGuiApplication.platformName() != "offscreen":
-            notify("Blue Station", text)
+            notify("Blue Station", text, URGENT if what == GONE else GENTLE)
+
+    def _new_device_alert(self, device: Device) -> None:
+        """New only's bell: something turned up that wasn't around before."""
+        text = f"New device: {device.title}, at {dbm(device.smoothed)} dBm."
+        self._status(text)
+        if QGuiApplication.platformName() != "offscreen":
+            notify("Blue Station", text, NOTICE)
 
     def _follow_badge(self) -> None:
         count = len(self.watcher.following())
@@ -482,6 +500,7 @@ class MainWindow(QMainWindow):
     def apply_theme(self) -> None:
         theme.apply(QApplication.instance())
         refresh_tool_icons(self.menu_btn)
+        refresh_tool_icons(self.devices.new_bell, color_key="accent" if self.devices.new_bell.isChecked() else "muted")
         for page in (self.track, self.survey, self.develop):
             page.refresh_icons()
         for search in (self.devices.search, self.trackers.search):
