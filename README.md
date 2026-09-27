@@ -39,7 +39,7 @@ blue-station
 
 `pipx upgrade blue-station` gets each new release. To install one
 particular version instead, add its tag to the end, like
-`Blue_Station.git@v1.4.0`. pipx then keeps that version, and
+`Blue_Station.git@v1.5.0`. pipx then keeps that version, and
 `pipx upgrade` won't move it.
 
 `blue-station --demo` fills the room with made-up devices, a made-up
@@ -104,9 +104,14 @@ Everything heard in the last 30 seconds, strongest first.
   SmartTag and Google tags, Windows PCs, Fast Pair accessories, heart
   rate straps, cycling sensors.
 - **A live signal bar and its number** in dBm. Green is excellent (−55
-  and up), blue good, amber fair, red weak (below −80). The number is
-  smoothed over about a second and a half, so it follows you without
-  flickering.
+  and up), blue good, amber fair, red weak (below −80). A device
+  advertises on three radio channels, and at any one spot each arrives
+  several dB stronger or weaker than the others, so its readings hop
+  about even when nothing moves. The number keeps to the strongest
+  reading of the last five seconds, less how far that usually stands
+  above the rest, so it holds still near the device's usual level. A
+  stronger signal shows as soon as it's heard, and a weaker one within
+  about six seconds.
 - **A rough distance**, and when a packet was last heard. Devices that
   go quiet fade out. **Show out of range** keeps them listed.
 - **One device, even when its address changes.** Phones, AirPods,
@@ -118,10 +123,15 @@ Everything heard in the last 30 seconds, strongest first.
   and page say how many times it changed, and how sure Blue Station is;
   70–95 % is usual. Signal strength says how far a device is, not which
   one it is, so two identical devices changing at the same moment are
-  left apart rather than guessed.
-- **It learns as it goes**, from the changes it's sure of. First, which
-  bytes of each kind of advertisement stay the same through a change:
-  an AirPlay target, for one, keeps its network address in it. A device
+  left apart rather than guessed. A change that turns out wrong is taken
+  back: a device never goes back to an address it has left, so when the
+  old address talks again, it gets back its row, name and history, and
+  the new one starts on its own. A device heard only every few seconds,
+  like a Find My device, may take up to a minute to start again; one
+  heard less often than every 40 seconds can't be timed at all.
+- **It learns as it goes.** First, from the changes it's sure of, which
+  bytes of each kind of advertisement stay the same through a change: an
+  AirPlay target, for one, keeps its network address in it. A device
   with enough such bytes is recognized even after a change nobody heard,
   out of range or while the Mac slept. It starts using them after the
   first change it's sure of, tentatively, and fully after the second:
@@ -130,7 +140,17 @@ Everything heard in the last 30 seconds, strongest first.
   as a new device then. Second, which devices change together: an Apple
   TV, say, sends two kinds of advertisement that change at the same
   moments. Those are listed as one device, the other kind carried along
-  with it. A device's card shows both.
+  with it. Third, which addresses send the very same bytes at the same
+  moment: a Mac sends its Nearby Info from an address that changes and,
+  word for word, from a fixed one too. Apple's messages carry a code
+  that changes with the address, so the two are one device, listed once,
+  and the fixed address carries the other through every change, even one
+  nobody heard. Fourth, which addresses go quiet and come back together
+  while everything else carries on: switch a Mac's Bluetooth off and on,
+  or restart it, and its own Find My advertisement, which changes
+  address on its own schedule and sends nothing like its others, joins
+  the rest. A device's card lists everything it sends, and how it's
+  known to be one device.
 - **Nearby only** lists only devices whose signal is within the range
   on the two-handle slider beside it, for busy places. The left handle
   is the weakest shown: roughly −60 dBm is close by in the same room,
@@ -195,18 +215,29 @@ how long it has been with you, in how many places, and a verdict:
 *Passing by*, *Staying near you* (20 minutes in one place, like a
 neighbour's tag) or **Following you**.
 
-- **Following you** means it has been with you in two different places.
-  Then the job button and the menu bar icon turn red, and a notification
-  with a sound says so. Click the tracker to find it with its own page.
+- **Following you** means it has been with you for 10 minutes, in two
+  different places. Seconds either side of a move are nobody following
+  you. Then the job button and the menu bar icon turn red, and a
+  notification with a sound says so. Click the tracker to find it with
+  its own page.
 - **Places without GPS.** A laptop has no GPS, so Blue Station
   recognizes places by their **landmarks**: named devices that stay put,
-  like TVs, printers and speakers. When most of the landmarks around you
-  are new, you've moved. That takes a few minutes after you arrive, and
-  **I've moved** tells it straight away. A named device that came along
-  from the last place, like your phone, can't describe a place, so it
-  stops being used as a landmark. That's all it changes: it's still
-  watched like any other device. Only you can say a device is yours,
-  with **This is mine**.
+  like TVs, printers and speakers, never the kinds people carry (phones,
+  watches, headphones, laptops): in traffic or a car park, other
+  people's phones stay near you for minutes, and would make a new place
+  every few minutes. When the landmarks of where you were have gone
+  quiet and most of those around you are new, you've moved. Somewhere
+  new becomes a place once you've stayed about 5 minutes, its landmarks
+  heard all that time: walking or driving past, a house's TV is heard
+  for 3 minutes at most. A place it knows is recognized after 3. New ones
+  turning up while the old ones are still heard are more of the same
+  place: they join it once heard alongside it for a few minutes, and
+  make it easier to recognize. Noticing a move takes a few minutes after
+  you arrive, and **I've moved** tells it straight away. A named device
+  that came along from the last place, like a speaker you took with you,
+  can't describe a place, so it stops being used as a landmark. That's
+  all it changes: it's still watched like any other device. Only you can
+  say a device is yours, with **This is mine**.
 - While you're between places, nothing is credited to a place. So a
   stranger's tag at a café can't be blamed on your home before the café
   is recognized.
@@ -232,16 +263,26 @@ neighbour's tag) or **Following you**.
 - **Watch for** adds other kinds of device: headphones and earbuds,
   watches, bands and health devices, phones and tablets, or anything
   else that could travel. TVs, speakers and beacons stay put, so they're
-  never watched. Most phones, AirPods and watches change their Bluetooth
-  address every 15 minutes or so. Blue Station follows them through
-  each change it hears, so one that travels with you stays one device;
-  one that changes out of earshot starts over. Devices that keep their
-  address, like many fitness bands, cheap earbuds and GPS trackers, are
-  the easiest to follow. Devices of those kinds that only passed by are
-  forgotten after 3 hours.
+  never watched. A device that sends several advertisements counts as
+  what the Scan page lists it as: a Mac's Nearby Info is a computer's,
+  under other devices, and an Apple TV's is a TV's. Most phones, AirPods
+  and watches change their Bluetooth address every 15 minutes or so.
+  Blue Station follows them through each change it hears, so one that
+  travels with you stays one device; one that changes out of earshot
+  starts over. Devices that keep their address, like many fitness bands,
+  cheap earbuds and GPS trackers, are the easiest to follow. Devices of
+  those kinds that only passed by are forgotten after 3 hours.
 - **This is mine**, on a device's own page, leaves one of your own
-  devices alone. **Watch my devices again** in the Watch for menu undoes
-  it for all of them.
+  devices alone, with every advertisement it sends. **Watch my devices
+  again** in the Watch for menu undoes it for all of them.
+- **Forget it**, also on a device's own page, forgets what the watch has
+  seen of it, and **Forget the ones following you** in the Watch for
+  menu does that for every device that may be following you: for ones
+  you've checked and aren't worried about. One still around starts over,
+  and needs 10 more minutes with you in two places before it's flagged
+  again. Your places and your own devices stay.
+- A device that sends several advertisements, like a Mac, is watched
+  and shown once, under the name the Scan page lists it by.
 
 ## Survey
 
@@ -268,7 +309,7 @@ neighbour's tag) or **Following you**.
 
 ## Develop
 
-![Develop: packet timing and payload, a packet log recording one device, and the GATT explorer following a heart rate](docs/develop.png)
+![Develop: packet timing and payload, a packet log recording one device with its name read, and the GATT explorer following a heart rate](docs/develop.png)
 
 Pick a device on the left.
 
@@ -281,8 +322,28 @@ Pick a device on the left.
   Counters and sensor values stand out at a glance.
 - **Packet log**: off until you press **Record**, so nothing piles up.
   It records this device (or **All devices**) exactly as heard, keeps
-  the last 100 000 packets, and exports to CSV. The table follows the
-  newest packets while it's scrolled to the top.
+  the last 350 000 packets, and exports to CSV. The table follows the
+  newest packets while it's scrolled to the top. Recording one device
+  follows it through its address changes, and so does the page. While it
+  records, the Mac doesn't go to sleep on its own, on battery too, so a
+  long recording carries on unattended; the screen may still go dark,
+  and closing the lid still puts it to sleep.
+- **Read names**, for studying address changes. While recording, Blue
+  Station connects to each device that accepts connections, once per
+  address, and reads what it says about itself: maker, model, serial
+  number and versions. These are public strings, never anything that
+  needs pairing, and nothing is written. The export puts what each
+  address told in an `identity` column, beside Blue Station's own guess
+  of which address it changed from (`changed_from` and `change_sure`).
+  The guess doesn't use the answers, so they can check it: two
+  addresses that told the same are most likely one device, and two that
+  told different things are two. Apple devices tell just their maker
+  and model, so two of the same model look alike. After a connection,
+  macOS also passes on the device's name to the scan, as after Connect
+  and read, though from Apple devices it's only *Mac* or *iPhone*. With
+  Nearby only on (Scan), only the devices within its range are asked.
+  Each read connects for a few seconds, and some devices go quiet
+  meanwhile.
 - **GATT**: **Connect** and stay connected. Browse every service,
   **Read** any characteristic, and **Follow** notifications live.
   Heart rate, battery, temperature and other standard values are
@@ -299,15 +360,17 @@ Pick a device on the left.
 
 - Distances are rough. Walls, bodies and pockets easily halve or double
   them. The trend and the signal itself are the reliable parts.
-- macOS passes on each device's packets about once or twice a second.
-  How often depends on the device, and not on whether Blue Station is
-  in front or the Mac is on battery. So "live" means about once a
-  second: plenty for finding things and watching trends.
+- macOS passes on most devices' packets about every second or two, and
+  some, like Find My devices, only every 10 seconds or so. How often
+  depends on the device, and not on whether Blue Station is in front or
+  the Mac is on battery. So "live" means about once a second: plenty for
+  finding things and watching trends.
 - Phones and many other devices change their Bluetooth address every
-  15 minutes or so for privacy. Blue Station follows the changes it
-  hears, and the ones it can recognize by learned bytes, but a phone
-  whose change it misses (out of range at the time, or silent for a
-  while) shows up as a new device.
+  15 minutes or so for privacy. Blue Station follows a change when it
+  hears it clearly, and recognizes some devices by learned bytes after
+  one it didn't hear. A phone shows up as a new device when its change
+  is missed: out of range at the time, silent for over a minute around
+  it, or changing at the same moment as a lookalike.
 - macOS shows each device under an address of its own making (a UUID
   that's the same only on your Mac). Where it can, Blue Station also
   shows the real Bluetooth address.
@@ -316,8 +379,9 @@ Pick a device on the left.
   are under Script Editor in System Settings → Notifications.
 - The AirPods, Find My, Apple activity and Windows readings come from
   community research, not from published specifications. They are good
-  hints, not guarantees. The same goes for the tracker verdicts. A
-  *Following you* is worth checking, and it's no proof.
+  hints, not guarantees. The same goes for the tracker verdicts and for
+  how sure Blue Station is about an address change. A *Following you*
+  is worth checking, and it's no proof.
 
 ## Keys
 
@@ -366,7 +430,22 @@ file. `trackers.json` then goes next to it.
 pip install -e .                     # the `blue-station` command, running this checkout
 python3 -m unittest discover tests   # core and interface tests (offscreen, no Bluetooth needed)
 python3 packaging/build_icon.py      # rebuild the app icon after editing packaging/icon.svg
+python3 tools/drive_check.py packets.csv track.gpx   # the tracker watch against a trip's GPS track
 ```
+
+**Checking the tracker watch on a trip.** Record the trip, a drive or a
+walk, in Develop (**Record**, **All devices**) while a GPS logging app on
+your phone saves a GPX track, then run `tools/drive_check.py` on the two.
+A stop is where you stood still: walking up and down a street isn't one.
+It replays the packets through the app's own code, starting from the
+places your watch already knows, and tells stop by stop whether the watch
+recognized where you were, how soon, whether it kept a place while you
+drove, whether the same place got the same answer each time, and what it
+thought was following you. The track is boiled down to when you stopped
+and which stops were the same place: nothing the tool prints holds a
+coordinate, and `--save-key key.json` keeps just that, so the GPX can be
+deleted. `--watch all` watches every kind of device, and `--fresh` starts
+knowing no places.
 
 - `blue_station/core/` has no Qt:
   - `scanner.py`: bleak on a background thread, and the demo

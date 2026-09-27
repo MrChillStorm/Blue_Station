@@ -140,6 +140,39 @@ class DeviceTest(unittest.TestCase):
         self.assertEqual(d.rssi, -50)
         self.assertEqual(d.packets, 60)
 
+    def test_three_channels_read_as_one_steady_number(self):
+        # heard every 1.5 s, on its three advertising channels in turn, each arriving at its own strength
+        d, channels, shown = Device("A", 0), [-70, -74, -83], []
+        for i in range(200):
+            d.update(sighting(channels[i % 3], i * 1.5))
+            if i >= 80:
+                shown.append(d.smoothed)
+        self.assertLess(max(shown) - min(shown), 1)  # while the readings hop 13 dB
+        self.assertAlmostEqual(sum(shown) / len(shown), sum(channels) / 3, delta=0.5)  # at its usual level
+
+    def test_closer_shows_at_once_and_further_within_seconds(self):
+        d = Device("A", 0)
+        for i in range(60):
+            d.update(sighting(-80, i * 1.5))
+        d.update(sighting(-60, 90))
+        self.assertGreater(d.smoothed, -61)
+        for i in range(1, 60):
+            d.update(sighting(-60, 90 + i * 1.5))
+        d.update(sighting(-80, 180))
+        self.assertGreater(d.smoothed, -61)  # one weak reading is most likely a weak channel
+        for t in (181.5, 183, 184.5, 186):
+            d.update(sighting(-80, t))
+        self.assertLess(d.smoothed, -79)
+
+    def test_a_new_address_carries_on_at_the_same_level(self):
+        store, channels = DeviceStore(), [-70, -74, -83]
+        store.ingest([Sighting("OLD", channels[i % 3], i * 1.5) for i in range(90)])
+        store.ingest([Sighting("NEW", -83, 136)])
+        old, new = store.devices["OLD"], store.devices["NEW"]
+        store.hand_over(old, new, 0.9)
+        store.ingest([Sighting("NEW", -70, 137.5)])
+        self.assertAlmostEqual(new.smoothed, old.smoothed, delta=1)
+
     def test_unknown_rssi_is_ignored(self):
         d = Device("A", 0)
         d.update(sighting(127, 0, name="Thing"))

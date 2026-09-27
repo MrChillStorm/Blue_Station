@@ -25,6 +25,11 @@ class Alerts:
         self._here[new] = True
         self._here.pop(old, None)
 
+    def take_back(self, old: str, new: str) -> None:
+        """A link found wrong (links.py): the old address was here as long as
+        the device it was taken for."""
+        self._here[old] = self._here.get(new, False)
+
     def update(self, now: float, devices, scanning: bool) -> list[tuple[object, str]]:
         """Returns (device, GONE or BACK) for each alert due."""
         if not scanning or (self._tick is not None and now - self._tick > GAP):

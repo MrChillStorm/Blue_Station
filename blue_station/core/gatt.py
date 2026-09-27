@@ -18,6 +18,9 @@ SUMMARY = {
     0x2A25: "Serial number", 0x2A27: "Hardware", 0x2A26: "Firmware", 0x2A28: "Software",
     0x2A19: "Battery", 0x2A50: "PnP ID", 0x2A07: "TX power", 0x2A23: "System ID",
 }
+# what tells one device from another: its name, maker, model, serial and versions. Public strings,
+# so reading them never asks to pair (a battery level may)
+IDENTITY = frozenset({0x2A00, 0x2A29, 0x2A24, 0x2A25, 0x2A27, 0x2A26, 0x2A28})
 
 
 @dataclass
@@ -88,8 +91,9 @@ def format_value(short: int | None, raw: bytes) -> str:
     return hex_bytes(raw, 32)
 
 
-async def read(target, timeout: float = 20) -> GattResult:
-    """target: a bleak BLEDevice (or an address). Raises on failure."""
+async def read(target, timeout: float = 20, only: frozenset[int] | None = None) -> GattResult:
+    """target: a bleak BLEDevice (or an address). only: just these
+    characteristics, like IDENTITY. Raises on failure."""
     from bleak import BleakClient
 
     summary = {}
@@ -97,7 +101,7 @@ async def read(target, timeout: float = 20) -> GattResult:
         services, chars = service_list(client)
         for char in (c for s in services for c in s.characteristics):
             short = names.short_uuid(char.uuid)
-            if char.readable and short in SUMMARY:
+            if char.readable and short in SUMMARY and (only is None or short in only):
                 try:
                     raw = bytes(await asyncio.wait_for(client.read_gatt_char(chars[char.handle]), 6))
                     char.value = format_value(short, raw)
@@ -137,7 +141,7 @@ def service_list(client) -> tuple[list[Service], dict[int, object]]:
     return services, chars
 
 
-def _why(exc: Exception) -> str:
+def why(exc: Exception) -> str:
     return "the device didn't answer" if isinstance(exc, asyncio.TimeoutError) else str(exc) or type(exc).__name__
 
 
@@ -210,7 +214,7 @@ class Link:
             raw = bytes(await asyncio.wait_for(self._client.read_gatt_char(self._chars[handle]), 10))
             self._put(handle, "read", raw)
         except Exception as exc:
-            self._put(handle, "error", text=f"Couldn't read: {_why(exc)}")
+            self._put(handle, "error", text=f"Couldn't read: {why(exc)}")
 
     async def _notify(self, handle: int, on: bool) -> None:
         try:
@@ -223,7 +227,7 @@ class Link:
                 await self._client.stop_notify(self._chars[handle])
         except Exception as exc:
             self.subscribed.discard(handle)
-            self._put(handle, "error", text=f"Couldn't {'start' if on else 'stop'} notifications: {_why(exc)}")
+            self._put(handle, "error", text=f"Couldn't {'start' if on else 'stop'} notifications: {why(exc)}")
 
     async def _close(self) -> None:
         try:

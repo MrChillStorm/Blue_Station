@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 from blue_station.core.baseline import Baseline
 from blue_station.core.decode import short_company
 from blue_station.core.devices import Device, DeviceStore, ago_text, distance_text
-from blue_station.core.links import lead
+from blue_station.core.links import listed
 from blue_station.ui import icons
 from blue_station.ui.theme import colors
 from blue_station.ui.widgets import (
@@ -142,7 +142,7 @@ class DeviceModel(QAbstractTableModel):
     def visible(self) -> list[Device]:
         return [d for d in self.store.devices.values()
                 if d.superseded_by is None  # an address it has changed from: the device is listed under its new one
-                and (d.partner is None or lead(d, d.partner) is d)  # one device sending two kinds: listed once
+                and listed(d) is d  # one device sending several advertisements: listed once
                 and (d.pinned or self.show_gone or not d.gone(self.now)) and (not self.needle or matches(d, self.needle))
                 and (d.pinned or not self.nearby_only or self.near(d))
                 and (d.pinned or self.baseline is None or self.baseline.is_new(d))

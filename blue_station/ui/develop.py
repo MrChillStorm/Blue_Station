@@ -3,6 +3,7 @@ Packet timing, what changed in the payload, a packet log that records
 only when asked, and a GATT explorer that reads any characteristic and
 follows notifications live."""
 import math
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,9 @@ from blue_station.core.packets import LIMIT, PacketLog, payload_text
 from blue_station.ui import icons
 from blue_station.ui.devices import DeviceModel, DeviceTable, HoverCards
 from blue_station.ui.theme import colors
-from blue_station.ui.widgets import StatTile, card, esc, label, link_button, subtitle, tool_button, refresh_tool_icons
+from blue_station.ui.widgets import (
+    ElidedLabel, StatTile, card, esc, label, link_button, refresh_tool_icons, subtitle, tool_button,
+)
 
 SHOWN = 300  # packets the log table shows; the rest wait in the log for export
 GAP_BINS = 30  # 10 ms to 10 s, ten bins a decade
@@ -289,21 +292,38 @@ class DevelopPage(QWidget):
         bar.addWidget(label("PACKET LOG", "caps"))
         self.record_btn = QPushButton("● Record")
         self.record_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.record_btn.setToolTip(f"Keep every packet as it arrives, up to the last {LIMIT:,}".replace(",", " "))
+        last = f"{LIMIT:,}".replace(",", " ")
+        self.record_btn.setToolTip(f"Keep every packet as it arrives, up to the last {last}. While it records, the Mac "
+                                   f"doesn't go to sleep on its own, on battery too (the screen may go dark); closing "
+                                   f"the lid still puts it to sleep.")
         self.record_btn.clicked.connect(self.toggle_record)
         self.all_devices = QCheckBox("All devices")
         self.all_devices.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.all_devices.setToolTip("Record every device, not just this one")
+        self.read_names = QCheckBox("Read names")
+        self.read_names.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.read_names.setToolTip(
+            "While recording, connect to each device that accepts connections, once per address, and read what it "
+            "says about itself: maker, model, serial number and versions. Nothing that needs pairing, and nothing is "
+            "written. Exported as the "
+            "identity column, beside Blue Station's own guess of which addresses are one device, so you can check "
+            "it. With Nearby only on (Scan), only the devices within its range.")
+        self.read_names.toggled.connect(self._toggle_read_names)
         self.log_clear = link_button("Clear", "Throw the recorded packets away")
         self.log_clear.clicked.connect(self.clear_log)
         self.log_export = tool_button("export", "Export the recorded packets as CSV (⌘E)", 18)
         self.log_export.clicked.connect(self.export_dialog)
-        bar.addWidget(self.record_btn)
-        bar.addWidget(self.all_devices)
         bar.addStretch(1)
         bar.addWidget(self.log_clear)
         bar.addWidget(self.log_export)
         box.addLayout(bar)
+        options = QHBoxLayout()  # a row of their own: half a window is narrow
+        options.setSpacing(16)
+        options.addWidget(self.record_btn)
+        options.addWidget(self.all_devices)
+        options.addWidget(self.read_names)
+        options.addStretch(1)
+        box.addLayout(options)
         self.log_stack = QStackedLayout()
         self.log_model = PacketModel(self.store, self)
         self.log_view = QTableView()
@@ -328,7 +348,7 @@ class DevelopPage(QWidget):
         self.log_stack.addWidget(self.log_off)
         self.log_stack.addWidget(self.log_view)
         box.addLayout(self.log_stack, 1)
-        self.log_note = label("", "faint")
+        self.log_note = ElidedLabel("", "faint")
         box.addWidget(self.log_note)
         return frame
 
@@ -392,6 +412,15 @@ class DevelopPage(QWidget):
         self.work.setCurrentIndex(1 if device else 0)
         self.tick(time.time())
 
+    def follow(self, old: Device, new: Device) -> None:
+        """The device changed its address: the page carries on with it. A
+        connection stays: it was made to the device, not the address."""
+        if self.device is old:
+            self.device = new
+            self.table.marked = new.address
+            self.table.viewport().update()
+            self._payload_key = None
+
     # ---- the packet log ------------------------------------------------------------------
 
     def toggle_record(self) -> None:
@@ -400,6 +429,10 @@ class DevelopPage(QWidget):
             self.message.emit(f"Stopped recording: {len(self.log.rows)} packets kept.")
         elif self.device or self.all_devices.isChecked():
             self.log.start(None if self.all_devices.isChecked() else self.device.address)
+        self.tick(time.time())
+
+    def _toggle_read_names(self, on: bool) -> None:
+        self.log.read_names = on
         self.tick(time.time())
 
     def clear_log(self) -> None:
@@ -418,7 +451,8 @@ class DevelopPage(QWidget):
             self.export(Path(path))
 
     def export(self, path: Path) -> None:
-        count = self.log.export(path, {a: d.title for a, d in self.store.devices.items()})
+        count = self.log.export(path, {a: d.title for a, d in self.store.devices.items()},
+                                {a: d.earlier[-1] for a, d in self.store.devices.items() if d.earlier})
         self.message.emit(f"Exported {count} packets to {path.name}.")
 
     # ---- GATT ------------------------------------------------------------------------------
@@ -615,7 +649,11 @@ class DevelopPage(QWidget):
         if log.recording:
             who = "every device" if log.address is None else (
                 self.store.devices[log.address].title if log.address in self.store.devices else "one device")
-            parts.append(f"recording {who}")
+            parts.append(f"recording {who}" + (", keeping the Mac awake" if sys.platform == "darwin" else ""))
+        told, failed, asking = log.read_counts()
+        if told or failed or asking:
+            parts.append(f"{told} name{'s' if told != 1 else ''} read" + (f", {failed} didn't answer" if failed else "")
+                         + (", reading" if asking else ""))
         if log.total != self._shown_total:
             parts.append(f"{log.total - self._shown_total} new: scroll to the top to follow")
         else:

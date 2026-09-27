@@ -59,6 +59,25 @@ class Scanner:
         self.state = IDLE
         self._submit(self._sync())
 
+    def restart(self) -> None:
+        """Scanning again from scratch, if it's meant to be on. macOS stops a
+        scan while the Mac sleeps, or while Bluetooth is off, and doesn't
+        start it again or say so: the window notices the silence."""
+        if self._want:
+            self._submit(self._restart())
+
+    async def _restart(self) -> None:
+        self._lock = self._lock or asyncio.Lock()
+        async with self._lock:
+            if self._running:
+                self._running = False
+                try:
+                    await self._scanner.stop()
+                except Exception:
+                    pass
+            self._scanner = None  # a new CoreBluetooth manager too: the old one may not have woken up right
+        await self._sync()
+
     def drain(self) -> list[Sighting]:
         out = []
         while True:
@@ -67,9 +86,12 @@ class Scanner:
             except Empty:
                 return out
 
-    def read_gatt(self, address: str) -> Future:
+    def read_gatt(self, address: str, only: frozenset[int] | None = None) -> Future:
+        """The quick look; only=gatt.IDENTITY for who it is, and quicker."""
         async def run():
-            return await gatt.read(self._ble.get(address, address))
+            if only is None:
+                return await gatt.read(self._ble.get(address, address))
+            return await asyncio.wait_for(gatt.read(self._ble.get(address, address), 10, only), 30)
         return self._submit(run())
 
     def connect(self, address: str) -> gatt.Link:
@@ -192,6 +214,7 @@ _DEMO = [
                         tx_power=12), (103, None)),
 ]
 _SAME_DEVICE = {14: 13}  # a later address -> the earlier one of the same device: its signal carries on
+_GATT_NAMES = {13: "Demo iPad"}  # the name it tells when asked, without advertising one
 
 
 class DemoScanner:
@@ -210,6 +233,9 @@ class DemoScanner:
 
     def stop(self) -> None:
         self.state = IDLE
+
+    def restart(self) -> None:
+        pass
 
     def close(self) -> None:
         self.state = IDLE
@@ -256,10 +282,11 @@ class DemoScanner:
         return DemoLink(_DEMO[index][0] if index >= 0 else None,
                         index >= 0 and bool(_DEMO[index][3].get("connectable")))
 
-    def read_gatt(self, address: str) -> Future:
+    def read_gatt(self, address: str, only: frozenset[int] | None = None) -> Future:
         future: Future = Future()
         index = self._addresses.index(address) if address in self._addresses else -1
-        name = _DEMO[index][0] if index >= 0 else None
+        index = _SAME_DEVICE.get(index, index)  # the same device says the same about itself at any address
+        name = _GATT_NAMES.get(index, _DEMO[index][0] if index >= 0 else None)
 
         def finish():
             if index < 0 or not _DEMO[index][3].get("connectable"):
@@ -279,6 +306,9 @@ class DemoScanner:
             summary = [("Device name", name or "Demo device"), ("Appearance", "Watch (0x00C0)"),
                        ("Manufacturer", "Example Devices"), ("Model", "EX-100"), ("Firmware", "2.4.1"),
                        ("Battery", "76 %")]
+            if only is not None:
+                summary = [(label, value) for label, value in summary
+                           if any(gatt.SUMMARY[short] == label for short in only)]
             future.set_result(gatt.GattResult(services, summary))
 
         timer = threading.Timer(1.2, finish)

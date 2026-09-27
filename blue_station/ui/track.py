@@ -44,6 +44,7 @@ class TrackPage(QWidget):
     back = Signal()
     changed = Signal(object)  # Device: nickname, pin, calibration or alerts changed
     mineToggled = Signal(object)  # Device: yours, or watched again
+    forgetAsked = Signal(object)  # Device: forget what the tracker watch has seen of it
     message = Signal(str)
 
     def __init__(self, read_gatt, parent=None):
@@ -51,6 +52,7 @@ class TrackPage(QWidget):
         self.read_gatt = read_gatt  # address -> concurrent.futures.Future of a GattResult
         self.watch_text = None  # device -> a sentence about it from the tracker watch, or None
         self.mine_state = None  # device -> True (yours), False (watched), None (not watched)
+        self.seen = None  # device -> whether the tracker watch has a record of it
         self.device: Device | None = None
         self._future = None
         self._ad_key = None
@@ -224,9 +226,16 @@ class TrackPage(QWidget):
         self.mine_btn = link_button("This is mine")
         self.mine_btn.hide()
         self.mine_btn.clicked.connect(lambda: self.device and self.mineToggled.emit(self.device))
+        self.forget_btn = link_button("Forget it", "Forget what the tracker watch has seen of it. If it's still around, "
+                                                   "it starts over: 10 minutes with you, in two places, before it's "
+                                                   "flagged again.")
+        self.forget_btn.hide()
+        self.forget_btn.clicked.connect(lambda: self.device and self.forgetAsked.emit(self.device))
         mine_row = QHBoxLayout()
         mine_row.setContentsMargins(0, 0, 0, 0)
+        mine_row.setSpacing(16)
         mine_row.addWidget(self.mine_btn)
+        mine_row.addWidget(self.forget_btn)
         mine_row.addStretch(1)
         box.addLayout(mine_row)
 
@@ -348,7 +357,7 @@ class TrackPage(QWidget):
         self.chart.show_device(d, now)
 
         key = (d._payload, d.mac, d.connectable, d.tx_power, len(d.earlier), d.fingerprint_bytes,
-               d.partner.address if d.partner else None)
+               tuple(p.address for p, _ in d.partners))
         if key != self._ad_key:
             self._ad_key = key
             self.ad.setText(kv_html(advertisement_rows(d), c))
@@ -362,6 +371,7 @@ class TrackPage(QWidget):
         mine = self.mine_state(d) if self.mine_state else None
         self.mine_btn.setVisible(mine is not None)
         self.mine_btn.setText("Watch it again" if mine else "This is mine")
+        self.forget_btn.setVisible(not mine and bool(self.seen and self.seen(d)))
         self.mine_btn.setToolTip("You said it's yours. The tracker watch will look at it again." if mine else
                                  "Your own devices go everywhere you go. Marked as yours, the tracker watch "
                                  "leaves it alone.")

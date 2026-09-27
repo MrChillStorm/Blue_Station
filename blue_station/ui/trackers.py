@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from blue_station.core.decode import short_company
 from blue_station.core.devices import DeviceStore, ago_text, span_text
+from blue_station.core.links import listed
 from blue_station.core.watch import FOLLOWING, GROUPS, HEARD_WITHIN, STAYING, TrackerRecord, Watcher
 from blue_station.ui.devices import HoverCards, text_matches
 from blue_station.ui import icons
@@ -33,8 +34,9 @@ _ORDER = {FOLLOWING: 0, STAYING: 1, "passing": 2}
 GROUP_ICONS = {"trackers": "tag", "headphones": "headphones", "wearables": "watch", "phones": "phone",
                "other": "generic"}
 
-EXPLAIN = ("A {noun} counts as following you once it has been with you in two different places. Places are "
-           "recognized from named devices that stay put (TVs, printers, speakers), which takes a few minutes after "
+EXPLAIN = ("A {noun} counts as following you once it has been with you for 10 minutes, in two different places. "
+           "Places are recognized from named devices that stay put (TVs, printers, speakers), which takes a few "
+           "minutes after "
            "you arrive. You can also say so yourself with I've moved. If it's one of yours, open it and choose "
            "This is mine.")
 MORE = (" Phones, AirPods and most watches change their Bluetooth address every 15 minutes or so. Blue Station "
@@ -114,15 +116,20 @@ class TrackerModel(QAbstractTableModel):
                     VERDICTS[record.verdict][0]][index.column()]
         return None
 
-    def around(self, record: TrackerRecord) -> bool:
+    def shown(self, record: TrackerRecord):
+        """The device a record is shown as: the one the Scan page lists, which
+        for a device sending several advertisements may not be the watched one."""
         d = self.store.devices.get(record.address)
+        return None if d is None else listed(d)
+
+    def around(self, record: TrackerRecord) -> bool:
+        d = self.shown(record)
         return d is not None and not d.gone(self.now)
 
     def matches(self, record: TrackerRecord) -> bool:
         """Like the Scan page's filter, plus the verdict and where it was with you."""
-        d = self.store.devices.get(record.address)
         words = [record.kind, record.address, VERDICTS[record.verdict][0], GROUPS.get(record.group)]
-        if d is not None:
+        for d in {self.store.devices.get(record.address), self.shown(record)} - {None}:
             words += [d.title, d.name, d.info.vendor, short_company(d.info.vendor), d.mac]
         words += [self.watcher.place_name(v[0]) for v in record.visits]
         return text_matches(" ".join(filter(None, words)), self.needle)
@@ -134,6 +141,13 @@ class TrackerModel(QAbstractTableModel):
             order = [r for r in order if r.verdict == FOLLOWING or self.around(r)]
         if self.needle:
             order = [r for r in order if self.matches(r)]
+        rows, shown = [], set()
+        for r in order:  # one row a device, however many of its advertisements are watched: the one saying most
+            d = self.shown(r)
+            if d is None or d.address not in shown:
+                rows.append(r)
+                shown.add(d.address if d is not None else None)
+        order = rows
         if [r.address for r in order] != [r.address for r in self.rows]:
             self.beginResetModel()
             self.rows = order
@@ -151,7 +165,7 @@ class TrackerDelegate(QStyledItemDelegate):
         c = colors()
         record: TrackerRecord = index.data(RECORD_ROLE)
         model: TrackerModel = index.model()
-        device = model.store.devices.get(record.address)
+        device = model.shown(record)
         heard = device is not None and not device.gone(model.now)
         text, key = VERDICTS[record.verdict]
         rect = QRectF(option.rect)
@@ -247,7 +261,7 @@ class TrackerTable(QTableView):
     def mouseMoveEvent(self, event) -> None:
         index = self.indexAt(event.position().toPoint())
         record = index.data(RECORD_ROLE) if index.isValid() else None
-        self.hovered.emit(self.model().store.devices.get(record.address) if record else None,
+        self.hovered.emit(self.model().shown(record) if record else None,
                           event.globalPosition().toPoint())
         row = index.row()
         if row != self.hover_row:
@@ -312,6 +326,9 @@ class TrackersPage(QWidget):
         self._lock_last()
         self.watch_menu.addSeparator()
         self.unmine_action = self.watch_menu.addAction("Watch my devices again", self.unmine)
+        self.unfollow_action = self.watch_menu.addAction("Forget the ones following you…", self.forget_following)
+        self.unfollow_action.setToolTip("Just those: one still around starts over, and needs 10 more minutes with "
+                                        "you in two places before it's flagged again. Places and your devices stay.")
         self.watch_menu.addAction("Forget history…", self.forget).setToolTip(
             "Forget every tracker and place seen so far")
         self.watch_menu.aboutToShow.connect(self._menu_shown)
@@ -380,6 +397,10 @@ class TrackersPage(QWidget):
         self.unmine_action.setText(f"Watch my devices again ({mine})" if mine else "Watch my devices again")
         self.unmine_action.setEnabled(bool(mine))
         self.unmine_action.setToolTip("Forget which devices you said are yours")
+        following = len(self.watcher.following())
+        self.unfollow_action.setText(f"Forget the ones following you ({following})…" if following
+                                     else "Forget the ones following you…")
+        self.unfollow_action.setEnabled(bool(following))
 
     def _lock_last(self) -> list[str]:
         """Something is always watched: the last kind ticked can't be unticked."""
@@ -428,6 +449,17 @@ class TrackersPage(QWidget):
                           "over the next few minutes.")
         self.tick(time.time())
 
+    def forget_following(self) -> None:
+        n = len(self.watcher.following())
+        answer = QMessageBox.question(
+            self, "Forget the ones following you",
+            f"Forget the {n} device{'s' if n != 1 else ''} that may be following you? One that's still around starts "
+            "over, and needs another 10 minutes with you, in two places, before it's flagged again.")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.watcher.forget_following()
+            self.changed.emit()
+            self.tick(time.time())
+
     def forget(self) -> None:
         answer = QMessageBox.question(self, "Forget history",
                                       "Forget every tracker and place Blue Station has seen so far?")
@@ -437,7 +469,7 @@ class TrackersPage(QWidget):
             self.tick(time.time())
 
     def _open(self, record: TrackerRecord) -> None:
-        device = self.store.devices.get(record.address)
+        device = self.model.shown(record)
         if device is None:
             self.message.emit(f"That {record.kind} hasn't been heard in this session "
                               f"(last {ago_text(time.time() - record.last_seen)}).")
@@ -446,7 +478,7 @@ class TrackersPage(QWidget):
 
     def _card_rows(self, device) -> list[tuple[str, str]]:
         """The hover card's own rows here: what the watch makes of it."""
-        record = self.watcher.record(device.address)
+        record = self.watcher.record_for(device)
         if record is None:
             return []
         places = len(record.places)

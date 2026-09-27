@@ -346,8 +346,8 @@ class TrackTest(WindowCase):
         while track._future is not None and time.time() < deadline:
             time.sleep(0.1)
             track.tick(time.time())
-        self.assertEqual(ipad.name, "Demo device")  # what its Device Name said
-        self.assertEqual(ipad.title, "Demo device")
+        self.assertEqual(ipad.name, "Demo iPad")  # what its Device Name said
+        self.assertEqual(ipad.title, "Demo iPad")
 
     def test_gatt_failure_is_shown(self):
         self.open("Thermo Sensor 3A")  # the demo's sensor doesn't accept connections
@@ -378,6 +378,7 @@ class TrackersJobTest(WindowCase):
         record = watcher.trackers[tag.address]
         self.assertEqual(record.places, {morning.id})
         self.assertEqual(record.verdict, "passing")
+        record.seen_seconds = 15 * 60  # ... for a while
         # ... and now you're somewhere new
         self.window.trackers.moved()
         watcher._checked = float("-inf")
@@ -452,6 +453,31 @@ class TrackersJobTest(WindowCase):
         self.assertEqual(page.search.text(), "")
         self.assertEqual(len(page.model.rows), everything)
 
+    def test_forgetting_the_ones_following_you_or_one(self):
+        from unittest import mock
+        from PySide6.QtWidgets import QMessageBox
+        from blue_station.core.watch import TrackerRecord
+        watcher, page, now = self.window.watcher, self.window.trackers, time.time()
+        tag = next(d for d in self.window.store.devices.values() if d.info.kind == "Find My device")
+        watcher.trackers[tag.address] = TrackerRecord(tag.address, "Find My device", now - 3600, now, 20 * 60, {1, 2})
+        watcher.trackers["NEIGHBOUR"] = TrackerRecord("NEIGHBOUR", "Tile tracker", now - 3600, now, 30 * 60, {1})
+        page._menu_shown()
+        self.assertTrue(page.unfollow_action.isEnabled())
+        self.assertIn("(1)", page.unfollow_action.text())
+        with mock.patch("blue_station.ui.trackers.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            page.forget_following()
+        self.assertNotIn(tag.address, watcher.trackers)
+        self.assertIn("NEIGHBOUR", watcher.trackers)
+
+        watcher.trackers[tag.address] = TrackerRecord(tag.address, "Find My device", now - 600, now, 60, {2})
+        self.window.show_device(tag)
+        self.window.tick()
+        track = self.window.track
+        self.assertTrue(track.forget_btn.isVisibleTo(track))
+        track.forget_btn.click()
+        self.assertNotIn(tag.address, watcher.trackers)
+        self.assertIn("starts over", self.window.statusBar().currentMessage())
+
     def test_out_of_range_ones_wait_behind_a_checkbox(self):
         from blue_station.core.watch import TrackerRecord
         self.window.show_job(TRACKERS)
@@ -460,7 +486,7 @@ class TrackersJobTest(WindowCase):
         now = time.time()
         watcher.trackers["GONE-TAG"] = TrackerRecord("GONE-TAG", "Tile tracker", now - 3600, now - 600)
         watcher.trackers["GONE-FOLLOWER"] = TrackerRecord("GONE-FOLLOWER", "Find My device", now - 3600, now - 600,
-                                                          places={1, 2})
+                                                          seen_seconds=20 * 60, places={1, 2})
         self.window.tick()
         shown = [r.address for r in page.model.rows]
         self.assertNotIn("GONE-TAG", shown)
@@ -637,8 +663,13 @@ class DevelopJobTest(WindowCase):
         self.window.tick()
         self.assertTrue(log.rows)
         self.assertTrue(all(s.address == self.band.address for s in log.rows))
+        if sys.platform == "darwin":  # a recording keeps the Mac awake, and only a recording
+            self.assertIsNotNone(self.window._awake)
+            self.assertIn("keeping the Mac awake", page.log_note.text())
         page.toggle_record()
         self.assertFalse(log.recording)
+        self.window.tick()
+        self.assertIsNone(self.window._awake)
         path = Path(self.tmp.name) / "packets.csv"
         page.export(path)
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -714,6 +745,72 @@ class DevelopJobTest(WindowCase):
         page.table.pick(self.device("Desk Keyboard"))
         self.assertIsNone(page.link)
         self.assertEqual(link.state, "closed")
+
+    def test_read_names_while_recording(self):
+        page, log = self.page, self.window.log
+        page.all_devices.setChecked(True)
+        page.read_names.setChecked(True)
+        self.window.tick()
+        self.assertIsNone(self.window._asking)  # only while recording
+        page.toggle_record()
+        self.window.tick()
+        address, future = self.window._asking
+        self.assertTrue(self.window.store.devices[address].connectable)
+        future.result(timeout=5)
+        self.window.tick()
+        self.assertTrue(log.identities[address].startswith("Device name="))
+        self.assertNotIn("Battery", log.identities[address])  # only who it is
+        self.assertNotEqual(self.window._asking[0], address)  # then the next one
+        self.assertIn("1 name read, reading", page.log_note.text())
+        self.assertIsNone(self.window.store.devices[address].name)  # the answer key stays out of the guessing
+        path = Path(self.tmp.name) / "packets.csv"
+        page.export(path)
+        with path.open(encoding="utf-8") as f:
+            told = {r["address"]: r["identity"] for r in csv.DictReader(f)}
+        self.assertEqual(told[address], log.identities[address])
+
+    def test_it_follows_the_device_through_an_address_change(self):
+        store, page = self.window.store, self.page
+        ipad = next(d for d in store.devices.values()
+                    if d.manufacturer_data.get(0x004C, b"")[:2] == bytes.fromhex("1006"))
+        page.table.pick(ipad)
+        page.toggle_record()
+        page.toggle_connection()
+        link = page.link
+        store.ingest([Sighting("NEW-ADDRESS", -67, time.time(), manufacturer_data=dict(ipad.manufacturer_data),
+                               connectable=True)])
+        self.window._hand_over(ipad, store.devices["NEW-ADDRESS"], 0.9)
+        self.assertIs(page.device, store.devices["NEW-ADDRESS"])
+        self.assertEqual(self.window.log.address, "NEW-ADDRESS")  # recording it, too
+        self.assertIs(page.link, link)  # still connected
+        self.assertNotEqual(link.state, "closed")
+        # then the old address talks again: it never changed, and the page goes back to it
+        self.window.linker._left[ipad.address] = ipad.last_seen  # as if the linker had made that link
+        store.ingest([Sighting(ipad.address, -66, time.time() + 1, manufacturer_data=dict(ipad.manufacturer_data))])
+        self.window.tick()
+        self.assertIsNone(ipad.superseded_by)
+        self.assertIs(page.device, ipad)
+        self.assertEqual(self.window.log.address, ipad.address)
+        self.assertEqual(store.devices["NEW-ADDRESS"].earlier, [])
+
+
+class KeepScanningTest(WindowCase):
+    def test_scanning_starts_again_after_sleep_or_silence(self):
+        w, restarts = self.window, []
+        self.scanner.restart = lambda: restarts.append(1)
+        w._ticked -= 60  # a minute between two ticks: the Mac was asleep
+        w.tick()
+        self.assertEqual(len(restarts), 1)
+        self.scanner.drain = lambda now=None: []  # and now nothing is heard at all
+        w._heard = w._restarted = time.time() - 40
+        w.tick()
+        self.assertEqual(len(restarts), 2)
+        w.tick()
+        self.assertEqual(len(restarts), 2)  # not again straight away
+        self.scanner.stop()
+        w._heard = w._restarted = time.time() - 40
+        w.tick()
+        self.assertEqual(len(restarts), 2)  # paused: nothing to miss
 
 
 class MenuBarTest(WindowCase):
@@ -794,8 +891,8 @@ class PartnerTest(WindowCase):
         ipad = next(d for d in self.window.store.devices.values()
                     if d.manufacturer_data.get(0x004C, b"")[:2] == bytes.fromhex("1006"))
         airplay = self.device("Living Room TV")
-        airplay.partner, ipad.partner = ipad, airplay
-        airplay.fingerprint_bytes = 8
+        airplay.partners, ipad.partners = [(ipad, "changes")], [(airplay, "changes")]
+        airplay.fingerprint_bytes, airplay.earlier = 8, [("AIRPLAY-BEFORE", 0.9)]
         page.model.refresh(time.time(), force=True)
         rows = page.model.rows
         self.assertEqual(len([d for d in (airplay, ipad) if d in rows]), 1)  # the more telling one
@@ -804,11 +901,93 @@ class PartnerTest(WindowCase):
         self.assertIn("changing address with it", details["Also sends"])
         self.assertIn("8 bytes", dict(advertisement_rows(airplay))["Recognized by"])
 
+    def test_one_device_sending_three_is_listed_once_with_the_others_on_its_card(self):
+        from blue_station.ui.widgets import advertisement_rows
+        page = self.window.devices
+        ipad = next(d for d in self.window.store.devices.values()
+                    if d.manufacturer_data.get(0x004C, b"")[:2] == bytes.fromhex("1006"))
+        tv, keyboard = self.device("Living Room TV"), self.device("Desk Keyboard")
+        ipad.partners = [(tv, "changes"), (keyboard, "same")]
+        tv.partners, keyboard.partners = [(ipad, "changes"), (keyboard, None)], [(ipad, "same"), (tv, None)]
+        page.model.refresh(time.time(), force=True)
+        self.assertEqual(len([d for d in (ipad, tv, keyboard) if d in page.model.rows]), 1)
+        rows = advertisement_rows(ipad)
+        at = [k for k, _ in rows].index("Also sends")
+        self.assertEqual([v for _, v in rows[at:at + 2]], ["Living Room TV, changing address with it",
+                                                           "Desk Keyboard, the same data from another address"])
+        self.assertEqual(rows[at + 1][0], "")
+
     def test_what_is_learned_is_saved(self):
         self.window.linker.steady["some kind"] = {2, 3, 4}
         self.window.linker.changes["some kind"] = 2
         self.window.close()
         self.assertEqual(prefs.load()["learned_bytes"]["some kind"], {"steady": [2, 3, 4], "changes": 2})
+
+
+class OneDeviceManyAdvertisementsTest(WindowCase):
+    """A Mac: Nearby Info from an address that changes, the same bytes from a fixed named one, and an AirPlay
+    target changing with the first."""
+
+    def setUp(self):
+        super().setUp()
+        store, now, nearby = self.window.store, time.time(), {0x004C: bytes.fromhex("10060b1c2d3e4f50")}
+        store.ingest([Sighting("ROTATING", -70, now, manufacturer_data=nearby, connectable=True),
+                      Sighting("FIXED", -71, now, name="Office Mac", manufacturer_data=nearby, connectable=True),
+                      Sighting("AIRPLAY", -72, now, manufacturer_data={0x004C: bytes.fromhex("0908" + "13" * 8)})])
+        linker = self.window.linker
+        linker.pairs.add(frozenset(("ROTATING", "AIRPLAY")))
+        linker.twins.add(frozenset(("ROTATING", "FIXED")))
+        linker._checked = float("-inf")
+        self.window.tick()
+        self.rotating, self.fixed, self.airplay = (store.devices[a] for a in ("ROTATING", "FIXED", "AIRPLAY"))
+
+    def test_listed_once_under_its_name_with_the_others_on_its_card(self):
+        page = self.window.devices
+        page.model.refresh(time.time(), force=True)
+        self.assertIn(self.fixed, page.model.rows)
+        self.assertNotIn(self.rotating, page.model.rows)
+        self.assertNotIn(self.airplay, page.model.rows)
+        card = page.hover.card
+        card.show_device(self.fixed, time.time())
+        self.assertIn("Apple device, the same data from another address", card.details.text())
+        self.assertIn("AirPlay target, from the same device", card.details.text())
+
+    def test_its_card_tells_the_address_changes_of_the_ones_that_change(self):
+        from blue_station.ui.widgets import advertisement_rows
+        self.rotating.earlier = [("ROTATING-1", 0.97), ("ROTATING-2", 0.98)]
+        self.airplay.earlier = [("AIRPLAY-1", 0.84)]
+        self.fixed.fingerprint_bytes = 3  # it never changes, so nothing it keeps then counts
+        rows = advertisement_rows(self.fixed)
+        at = [k for k, _ in rows].index("Address changes")
+        self.assertEqual(rows[at + 1][0], "")
+        self.assertTrue(rows[at][1].startswith("AirPlay target: once since"))
+        self.assertTrue(rows[at + 1][1].startswith("Apple device: 2 times since"))
+        self.assertNotIn("Recognized by", [k for k, _ in rows])
+        card = self.window.devices.hover.card
+        card.show_device(self.fixed, time.time())
+        self.assertIn("Apple device: 2 times since", card.details.text())
+
+    def test_trackers_show_it_the_same_way(self):
+        from blue_station.core.watch import TrackerRecord
+        watcher, now = self.window.watcher, time.time()
+        watcher.trackers["ROTATING"] = TrackerRecord("ROTATING", "Apple device", now - 3600, now, 3600)
+        watcher.trackers["FIXED"] = TrackerRecord("FIXED", "Computer", now - 60, now, 60)
+        page = self.window.trackers
+        page.model.refresh(now)
+        shown = [page.model.shown(r) for r in page.model.rows]
+        self.assertEqual(shown.count(self.fixed), 1)  # one row, under its name
+        self.assertNotIn(self.rotating, shown)
+        self.assertIs(page.model.rows[shown.index(self.fixed)], watcher.trackers["ROTATING"])  # the one saying most
+        self.assertIn(("With you", "1 h 00 min"), page._card_rows(self.fixed))
+
+    def test_this_is_mine_covers_every_advertisement_it_sends(self):
+        from blue_station.core.watch import TrackerRecord
+        now = time.time()
+        self.window.watcher.trackers["ROTATING"] = TrackerRecord("ROTATING", "Apple device", now - 600, now, 600)
+        self.window._toggle_mine(self.fixed)
+        self.assertLessEqual({"ROTATING", "FIXED", "AIRPLAY"}, self.window.watcher.mine)
+        self.assertNotIn("ROTATING", self.window.watcher.trackers)
+        self.assertTrue(self.window._mine_state(self.rotating))
 
 
 class ThemeTest(WindowCase):

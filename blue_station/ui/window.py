@@ -19,11 +19,11 @@ from PySide6.QtWidgets import (
     QStackedWidget, QStatusBar, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from blue_station.core import login, names, prefs
+from blue_station.core import gatt, login, names, prefs
 from blue_station.core.alerts import GONE, Alerts
-from blue_station.core.links import Linker
+from blue_station.core.links import Linker, listed
 from blue_station.core.devices import Device, DeviceStore, span_text
-from blue_station.core.packets import PacketLog
+from blue_station.core.packets import PacketLog, identity_text
 from blue_station.core.watch import DEFAULT_GROUPS, FOLLOWING, GROUPS, Watcher
 from blue_station.ui import icons, theme
 from blue_station.ui.develop import DevelopPage
@@ -43,6 +43,8 @@ JOB_TIPS = [
     "Packets, timing, a packet log and GATT for one device (⌘4)",
 ]
 TICK_MS = 200
+ASLEEP = 10.0  # seconds between two ticks that mean the Mac was asleep: its scan needs starting again
+SILENT = 30.0  # seconds without a single packet while scanning: start it again (at most this often)
 SAVE_WATCH_EVERY = 60
 
 HELP = """<h3>Blue Station</h3>
@@ -50,7 +52,7 @@ HELP = """<h3>Blue Station</h3>
 <p><b>Scan</b>: every Bluetooth Low Energy device around you, with a live signal bar each. Hover one for its
 details and last minute of signal.</p>
 <p><b>Trackers</b>: AirTags and other item trackers, and whether one is following you, meaning it has been
-with you in two different places. It watches in the background whichever job you're in. <b>Watch for</b> adds
+with you for 10 minutes, in two different places. It watches in the background whichever job you're in. <b>Watch for</b> adds
 other kinds of device, and <b>This is mine</b> on a device's page leaves one of yours alone.</p>
 <p><b>Survey</b>: checks beacons (a silent one shows up as gone quiet) and maps coverage on a floor plan.
 Click where you stand and hold still for five seconds.</p>
@@ -104,6 +106,9 @@ class MainWindow(QMainWindow):
         groups = [g for g in self.settings.get("watch_for", DEFAULT_GROUPS) if g in GROUPS] or DEFAULT_GROUPS
         self.watcher = Watcher(scanner.watch_history(time.time()) if demo else prefs.load(prefs.TRACKERS), groups)
         self.log = PacketLog()
+        self._asking = None  # (address, Future): Read names, one device at a time
+        self._awake = None  # while recording: macOS's token for keeping the Mac from sleeping
+        self._ticked = self._heard = self._restarted = time.time()  # the last tick, packet and restart
         self.alerts = Alerts()
         self.linker = Linker(None if demo else self.settings.get("learned_bytes"))
         self.menubar: MenuBar | None = None
@@ -128,6 +133,7 @@ class MainWindow(QMainWindow):
         self.track = TrackPage(self.scanner.read_gatt)
         self.track.watch_text = self._watch_text
         self.track.mine_state = self._mine_state
+        self.track.seen = lambda d: self.watcher.record_for(d) is not None
         for page in (self.devices, self.trackers, self.survey, self.develop, self.track):
             self.pages.addWidget(page)
             page.message.connect(self._status)
@@ -146,6 +152,7 @@ class MainWindow(QMainWindow):
         self.trackers.changed.connect(self._save_watch)
         self.trackers.groupsChanged.connect(self._watch_for)
         self.track.mineToggled.connect(self._toggle_mine)
+        self.track.forgetAsked.connect(self._forget_device)
         self.views.changed.connect(self.show_job)
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda *_: self.apply_theme())
         self._shortcuts()
@@ -322,9 +329,14 @@ class MainWindow(QMainWindow):
         if sightings:
             self.store.ingest(sightings)
             self.log.add(sightings)
+        self._keep_scanning(now, bool(sightings))
         devices = list(self.store.devices.values())
+        for old in self.linker.taken_back(self.store.devices):
+            self._take_back(old)
         for old, new, sure in self.linker.update(now, devices):
             self._hand_over(old, new, sure)
+        self._ask_names(now, devices)
+        self._stay_awake(self.log.recording)
         for record in self.watcher.update(now, devices):
             self._alert(record)
         for device, what in self.alerts.update(now, devices, self.scanner.state == "scanning"):
@@ -381,6 +393,79 @@ class MainWindow(QMainWindow):
             self._save()
         if self.on_page(self.track) and self.track.device is old:
             self.track.show_device(new)  # the page follows the device
+        self.develop.follow(old, new)
+        if self.log.address == old.address:
+            self.log.address = new.address  # and so does recording it
+
+    def _take_back(self, old: Device) -> None:
+        """A change of address turned out wrong: the old address talks again
+        (links.py). It carries on as itself, and the pages that followed it
+        to the new one come back with it."""
+        later = self.store.take_back(old)
+        if not later:
+            return
+        head = later[-1]
+        self.watcher.take_back(old.address, [d.address for d in later], later[0].heard_from)
+        self.alerts.take_back(old.address, head.address)
+        if not self.demo and old.address in self.store.known:
+            self.settings["known"] = self.store.known
+            self._save()
+        if self.on_page(self.track) and self.track.device is head:
+            self.track.show_device(old)
+        self.develop.follow(head, old)
+        if self.log.address == head.address:
+            self.log.address = old.address
+
+    def _keep_scanning(self, now: float, heard: bool) -> None:
+        """macOS stops the scan while the Mac sleeps (or Bluetooth is off) and
+        doesn't say so. Starts it again after a sleep, or after a silence no
+        room full of devices would keep; if Bluetooth is off, until it's on."""
+        slept, self._ticked = now - self._ticked > ASLEEP, now
+        if heard:
+            self._heard = now
+        if self.scanner.state not in ("scanning", "error"):
+            self._heard = self._restarted = now  # paused, or just starting: nothing to miss
+            return
+        if slept or (now - self._heard > SILENT and now - self._restarted > SILENT):
+            self._heard = self._restarted = now
+            self.scanner.restart()
+
+    def _stay_awake(self, recording: bool) -> None:
+        """While the packet log records, the Mac doesn't go to sleep on its
+        own, on battery too: a recording would stop with it. The screen may
+        still go dark, and closing the lid still puts it to sleep."""
+        if recording == (self._awake is not None) or sys.platform != "darwin":
+            return
+        try:
+            from Foundation import NSActivityIdleSystemSleepDisabled, NSProcessInfo
+            info = NSProcessInfo.processInfo()
+            if recording:
+                self._awake = info.beginActivityWithOptions_reason_(NSActivityIdleSystemSleepDisabled,
+                                                                    "Recording Bluetooth packets")
+            else:
+                info.endActivity_(self._awake)
+                self._awake = None
+        except Exception:
+            pass
+
+    def _ask_names(self, now: float, devices) -> None:
+        """Read names, while recording: ask each device the packet log
+        records who it is, one at a time. Kept apart from the linker, so
+        the answers can check its guesses."""
+        if self._asking is not None:
+            address, future = self._asking
+            if not future.done():
+                return
+            self._asking = None
+            try:
+                self.log.answer(address, identity_text(future.result().summary))
+            except Exception as exc:
+                self.log.answer(address, f"error={gatt.why(exc)}")
+        model = self.devices.model
+        device = self.log.next_to_ask(now, devices, model.near if model.nearby_only else None)
+        if device is not None:
+            self.log.asking(device.address)
+            self._asking = (device.address, self.scanner.read_gatt(device.address, only=gatt.IDENTITY))
 
     def _device_alert(self, device: Device, what: str) -> None:
         """One you asked for on the device's page: out of range, or back."""
@@ -408,9 +493,9 @@ class MainWindow(QMainWindow):
             button.style().polish(button)
 
     def _watch_text(self, device: Device) -> str | None:
-        if device.address in self.watcher.mine:
+        if self.watcher.is_mine(device):
             return "You said this is yours, so the tracker watch leaves it alone."
-        record = self.watcher.record(device.address)
+        record = self.watcher.record_for(device)
         if record is None:
             return None
         text = f"Blue Station has heard it with you for {span_text(record.seen_seconds)}"
@@ -425,16 +510,25 @@ class MainWindow(QMainWindow):
     def _mine_state(self, device: Device) -> bool | None:
         """True: you said it's yours. False: it's watched, and could be. None:
         not something the watch looks at."""
-        if device.address in self.watcher.mine:
+        if self.watcher.is_mine(device):
             return True
-        return False if self.watcher.watches(device.info) else None
+        return False if self.watcher.watches(listed(device).info) else None
+
+    def _forget_device(self, device: Device) -> None:
+        if self.watcher.forget_device(device):
+            self._save_watch()
+            self._status(f"Forgot what the tracker watch had seen of {device.title}. If it's still around, it starts "
+                         "over.")
+            self.tick()
 
     def _toggle_mine(self, device: Device) -> None:
-        mine = device.address not in self.watcher.mine
-        self.watcher.set_mine(device.address, mine)
+        """For every advertisement the device sends: the watch may be following any of them."""
+        mine = not self.watcher.is_mine(device)
+        for d in (device, *(p for p, _ in device.partners)):
+            self.watcher.set_mine(d.address, mine)
         self._save_watch()
-        self._status("Marked as yours: the tracker watch leaves it alone. A device that changes its Bluetooth "
-                     "address comes back as a new one." if mine else "The tracker watch watches it again.")
+        self._status("Marked as yours: the tracker watch leaves it alone, also through the address changes it "
+                     "hears." if mine else "The tracker watch watches it again.")
         self.tick()
 
     def _watch_for(self, groups: list[str]) -> None:

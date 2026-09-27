@@ -12,13 +12,56 @@ FADE_AFTER = 5.0  # seconds without a packet before a device starts to fade
 GONE_AFTER = 30.0  # ... and before it counts as out of range
 HISTORY_SECONDS = 15 * 60
 HISTORY_MAX = 20_000
-SMOOTHING = 1.5  # seconds; the time constant of the smoothed signal
+# what a device carries on from its earlier address, when it has none of its own: its name, and what
+# you gave it
+CARRIED = ("name", "nickname", "calibration", "pinned", "alert_gone", "alert_back")
+# The signal shown is the strongest reading of the last PEAK seconds, less how far that peak has
+# stood above the readings over about LEAD seconds. A device advertises on three radio channels,
+# and at any one spot each arrives at a strength of its own, several dB apart; macOS reports one
+# reading per advertisement, from whichever channel it caught. An average hops between them, while
+# the strongest keeps to one. Tuned on two devices that stayed put for 3 hours at home: the number
+# changes half as often as a 1.5 s average's did, rises as fast, and settles within about 6 s when
+# the signal falls. The lead brings it back to the device's usual level (within about 1 dB), so
+# distances and the signal's labels mean what they did.
+PEAK = 5.0
+LEAD = 60.0
+
+
+class Smoother:
+    """The shown signal, one reading at a time (see PEAK and LEAD)."""
+
+    def __init__(self):
+        self.recent: deque[tuple[float, int]] = deque()  # the readings of the last PEAK seconds
+        self.lead: float | None = None
+        self.count = 0  # readings the lead has seen
+        self.last: float | None = None
+
+    def add(self, t: float, rssi: int) -> float:
+        if self.last is not None and t < self.last:  # a clock that stepped back
+            self.recent.clear()
+        self.recent.append((t, rssi))
+        while self.recent[0][0] < t - PEAK:
+            self.recent.popleft()
+        peak = max(r for _, r in self.recent)
+        self.count += 1
+        if self.lead is None:
+            self.lead = float(peak - rssi)
+        else:  # an average of all so far to begin with, then of about the last LEAD seconds
+            weight = max(1 - math.exp(-max(t - self.last, 0.0) / LEAD), 1 / self.count)
+            self.lead += weight * (peak - rssi - self.lead)
+        self.last = t
+        return peak - self.lead
+
+    def carry_on(self, earlier: "Smoother") -> None:
+        """Same device, new address: what the lead learned still holds."""
+        if earlier.lead is not None:
+            self.lead, self.count = earlier.lead, earlier.count + self.count
 PATH_LOSS = 2.5  # how fast signal falls with distance indoors (2 is open air)
 TYPICAL_1M = -59  # dBm at 1 m, when neither a beacon nor a calibration says better
 RSSI_MIN, RSSI_MAX = -100, -30  # the ends of every signal bar
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Sighting:
     """One advertisement as the scanner heard it."""
     address: str
@@ -114,9 +157,11 @@ class Device:
         # the value each payload had before its last change, for showing what changed
         self.previous: dict[str, bytes] = {}
         self.payload_changes = 0
-        self.first_seen = self.last_seen = t
+        self.first_seen = self.last_seen = t  # first_seen reaches back through its earlier addresses...
+        self.heard_from = t  # ... this is its own first packet
         self.rssi: int | None = None  # the last packet's
         self.smoothed: float | None = None
+        self._smoother = Smoother()
         self.packets = 0
         self.history: deque[tuple[float, int]] = deque()
         self.info: Info = decode(None, {}, [], {})
@@ -130,7 +175,9 @@ class Device:
         # the same device under earlier addresses (see links.py): [(address, how sure), ...], oldest first
         self.earlier: list[tuple[str, float]] = []
         self.superseded_by: str | None = None  # this address was handed over to that one
-        self.partner: Device | None = None  # the same device's other advertisement (links.py)
+        self.carried: dict[str, str] = {}  # of CARRIED, what it has from an earlier address, and whose it was
+        self.passed_on = 0  # packets it handed over to that one, with its history
+        self.partners: list = []  # the same device's other advertisements: (device, how it's known), links.py
         self.fingerprint_bytes = 0  # bytes it keeps through address changes, when enough to recognize it by
         self.fingerprint_confirmed = False  # ... seen through more than one change
 
@@ -139,6 +186,7 @@ class Device:
     def update(self, s: Sighting) -> None:
         if s.name:
             self.name = s.name
+            self.carried.pop("name", None)
         if s.tx_power is not None:
             self.tx_power = s.tx_power
         if s.connectable is not None:
@@ -167,15 +215,11 @@ class Device:
 
         # CoreBluetooth says 127 when it has no reading for a packet
         if -127 < s.rssi < 20:
-            if self.smoothed is None:
-                self.smoothed = float(s.rssi)
-            else:
-                weight = 1 - math.exp(-max(s.t - self.last_seen, 0.0) / SMOOTHING)
-                self.smoothed += weight * (s.rssi - self.smoothed)
             self.rssi = s.rssi
             self.history.append((s.t, s.rssi))
             while self.history and (self.history[0][0] < s.t - HISTORY_SECONDS or len(self.history) > HISTORY_MAX):
                 self.history.popleft()
+            self.smoothed = self._smoother.add(s.t, s.rssi)
         self.last_seen = max(self.last_seen, s.t)
         self.packets += 1
 
@@ -184,10 +228,13 @@ class Device:
         the device itself, or carried over from its earlier address."""
         if name and not self.name:
             self.name = name
-            self._payload = (self.name, tuple(self.manufacturer_data.items()), tuple(self.service_uuids),
-                             tuple(self.service_data.items()))
-            self.info = decode(self.name, self.manufacturer_data, self.service_uuids, self.service_data,
-                               self.eddystone or None)
+            self._decode()
+
+    def _decode(self) -> None:
+        self._payload = (self.name, tuple(self.manufacturer_data.items()), tuple(self.service_uuids),
+                         tuple(self.service_data.items()))
+        self.info = decode(self.name, self.manufacturer_data, self.service_uuids, self.service_data,
+                           self.eddystone or None)
 
     def _eddystone_turn(self, key: str, old: bytes, new: bytes) -> bool:
         """An Eddystone beacon switching between frame types isn't a change of
@@ -340,19 +387,57 @@ class DeviceStore:
         history and name, and with the name, pin, calibration and alerts you
         gave it."""
         new.earlier = old.earlier + [(old.address, sure)]
-        new.learn_name(old.name)
+        for what in CARRIED:
+            value = getattr(old, what)
+            if value not in (None, False, "") and getattr(new, what) in (None, False, ""):
+                new.carried[what] = old.carried.get(what, old.address)
+                if what == "name":
+                    new.learn_name(value)
+                else:
+                    setattr(new, what, value)
         old.superseded_by = new.address
         new.first_seen = min(new.first_seen, old.first_seen)
         new.history = deque(sorted(list(old.history) + list(new.history)))
+        new._smoother.carry_on(old._smoother)
+        old.passed_on = old.packets
         new.packets += old.packets
-        new.nickname = new.nickname or old.nickname
-        new.calibration = new.calibration if new.calibration is not None else old.calibration
-        new.pinned = new.pinned or old.pinned
-        new.alert_gone = new.alert_gone or old.alert_gone
-        new.alert_back = new.alert_back or old.alert_back
         if old.address in self.known:
             self.remember(new)
             self.known.pop(old.address, None)
+
+    def take_back(self, old: Device) -> list[Device]:
+        """The old address talks again, so it never changed to the one it
+        was handed over to (a device that changes its address never goes
+        back to the old one): the link was wrong. It lives on as itself, and
+        what it passed on down the chain is taken back. Returns the devices
+        it had passed on to, the chain's end last."""
+        after = self.devices.get(old.superseded_by or "")
+        old.superseded_by = None
+        if after is None:
+            return []
+        gone = {old.address, *(a for a, _ in old.earlier)}  # it, and what it carried on from before
+        chain = sorted((d for d in self.devices.values() if any(a == old.address for a, _ in d.earlier)),
+                       key=lambda d: d.heard_from)
+        for d in chain:
+            d.earlier = [e for e in d.earlier if e[0] not in gone]
+            d.first_seen = after.heard_from
+            d.history = deque(h for h in d.history if h[0] >= after.heard_from)
+            d._smoother = Smoother()
+            d.smoothed = None
+            for t, rssi in d.history:
+                d.smoothed = d._smoother.add(t, rssi)
+            d.packets -= old.passed_on
+            for what, whose in list(d.carried.items()):
+                if whose in gone:
+                    del d.carried[what]
+                    setattr(d, what, None if what in ("name", "nickname", "calibration") else False)
+                    if what == "name":
+                        d._decode()
+            if d.address in self.known:
+                self.remember(d)
+        old.passed_on = 0
+        self.remember(old)
+        return chain
 
     def clear(self) -> None:
         """Forgets this session's devices, except pinned ones and ones with

@@ -1,7 +1,6 @@
 """Small widgets and painting shared by both pages: signal bars, the
 signal history chart, the hover card, stat tiles, the scan indicator."""
 import html
-import math
 import time
 from datetime import datetime
 
@@ -13,8 +12,9 @@ from PySide6.QtWidgets import (
 
 from blue_station.core.decode import hex_bytes, short_company
 from blue_station.core.devices import (
-    RSSI_MAX, RSSI_MIN, SMOOTHING, Device, ago_text, distance_text, fraction, quality,
+    RSSI_MAX, RSSI_MIN, Device, Smoother, ago_text, distance_text, fraction, quality,
 )
+from blue_station.core.links import CHANGES_WITH_IT, OFF_AND_ON, SAME_DATA
 from blue_station.core import names
 from blue_station.ui import icons
 from blue_station.ui.theme import colors, signal_color
@@ -168,16 +168,23 @@ def advertisement_rows(device: Device) -> list[tuple[str, str]]:
             ("Maker", device.info.vendor or "—"), ("Address", device.address)]
     if device.mac:
         rows.append(("Bluetooth address", device.mac))
-    if device.earlier:  # the same device under earlier addresses (links.py)
-        n, least = len(device.earlier), round(100 * min(p for _, p in device.earlier))
-        since = datetime.fromtimestamp(device.first_seen).strftime("%H:%M")
-        rows.append(("Address changes", f"Once since {since}, {least}\u00a0% sure" if n == 1  # 91 % kept together
-                     else f"{n} times since {since}, each at least {least}\u00a0% sure"))
-    if device.fingerprint_bytes:
+    # the same device under earlier addresses (links.py), for each of its advertisements that changes
+    changed = [d for d in (device, *(p for p, _ in device.partners)) if d.earlier]
+    for i, d in enumerate(changed):
+        n, least = len(d.earlier), round(100 * min(p for _, p in d.earlier))
+        since = datetime.fromtimestamp(d.first_seen).strftime("%H:%M")
+        text = (f"once since {since}, {least}\u00a0% sure" if n == 1  # 91 % kept together
+                else f"{n} times since {since}, each at least {least}\u00a0% sure")
+        text = f"{d.title}: {text}" if device.partners else text[0].upper() + text[1:]
+        rows.append(("Address changes" if i == 0 else "", text))
+    if device.fingerprint_bytes and device.earlier:  # it's about changing address, which a fixed one never does
         rows.append(("Recognized by", f"{device.fingerprint_bytes} bytes it keeps when it changes address"
                      + ("" if device.fingerprint_confirmed else " (seen through one change so far)")))
-    if device.partner is not None:
-        rows.append(("Also sends", f"{device.partner.info.kind or 'another advertisement'}, changing address with it"))
+    for i, (partner, how) in enumerate(device.partners):
+        rows.append(("Also sends" if i == 0 else "", f"{partner.title}, " + {
+            CHANGES_WITH_IT: "changing address with it", SAME_DATA: "the same data from another address",
+            OFF_AND_ON: "going off and on with it",
+        }.get(how, "from the same device")))
     rows.append(("Connectable", {True: "Yes", False: "No", None: "—"}[device.connectable]))
     if device.tx_power is not None:
         rows.append(("TX power", f"{device.tx_power} dBm"))
@@ -221,15 +228,8 @@ def paint_signal(p: QPainter, rect: QRectF, rssi: float | None, c: dict, peak: f
 
 def smoothed_series(points: list[tuple[float, int]]) -> list[tuple[float, float]]:
     """The same smoothing as the live number, run over a stretch of history."""
-    out, value, last = [], None, None
-    for t, r in points:
-        if value is None or not 0 <= t - last <= 10:  # a gap, or a clock that stepped back
-            value = float(r)
-        else:
-            value += (1 - math.exp(-(t - last) / SMOOTHING)) * (r - value)
-        last = t
-        out.append((t, value))
-    return out
+    smoother = Smoother()
+    return [(t, smoother.add(t, r)) for t, r in points]
 
 
 class SignalMeter(QWidget):
@@ -446,9 +446,14 @@ class HoverCard(QFrame):
                 ("Packets", f"{device.packets}  ·  {device.rate(now):.1f} per second")]
         address = device.mac or device.address
         rows.append(("Address", address if len(address) <= 20 else f"{address[:8]}…{address[-6:]}"))
-        rows += [r for r in advertisement_rows(device)
-                 if r[0] in ("Address changes", "Recognized by", "Also sends", "Connectable", "TX power",
-                             "Service")][:6]
+        wanted, keep = [], False
+        for label_, value in advertisement_rows(device):
+            if label_:  # a row without a label carries on the one above: kept with it
+                keep = label_ in ("Address changes", "Recognized by", "Also sends", "Connectable", "TX power",
+                                  "Service")
+            if keep:
+                wanted.append((label_, value))
+        rows += wanted[:8]
         rows += device.info.fields[:6]
         self.details.setText(kv_html(rows, c, 118))  # room for "Address changes" on one line
         # wrapped lines need height the card wouldn't reserve by itself: as tall as they are at its width

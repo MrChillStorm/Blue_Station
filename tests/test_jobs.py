@@ -15,13 +15,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from blue_station.core import gatt, login
 from blue_station.core.alerts import BACK, GONE, Alerts
 from blue_station.core.baseline import Baseline
-from blue_station.core.links import Linker
+from blue_station.core.links import Linker, lead, listed
 from blue_station.core.devices import Device, DeviceStore, Sighting, gap_stats
-from blue_station.core.packets import PacketLog
+from blue_station.core.packets import PacketLog, identity_text, read as read_packets
 from blue_station.core.scanner import Scanner
 from blue_station.core.survey import COUNT, DEVICE, HOLD, NOT_HEARD, STRONGEST, Point, Survey
 from blue_station.core.decode import decode
-from blue_station.core.watch import DEFAULT_GROUPS, FOLLOWING, PASSING, STAYING, Watcher, group
+from blue_station.core.watch import DEFAULT_GROUPS, FOLLOWING, PASSING, STAYING, TrackerRecord, Watcher, group
 
 
 def uuid16(short: int) -> str:
@@ -70,7 +70,7 @@ class WatchTest(unittest.TestCase):
         cafe = walk.watcher.settled
         self.assertIsNotNone(cafe)
         self.assertNotEqual(cafe.id, home.id)
-        self.assertIn("PHONE", walk.watcher.companions)  # it came along, so it describes no place
+        self.assertFalse(any("PHONE" in p.landmarks for p in walk.watcher.places.values()))  # people carry phones
         self.assertEqual(walk.verdict("TAG"), FOLLOWING)
         self.assertEqual(walk.watcher.trackers["STRANGER"].places, {cafe.id})
         self.assertNotEqual(walk.verdict("STRANGER"), FOLLOWING)
@@ -79,6 +79,97 @@ class WatchTest(unittest.TestCase):
         walk.stay(2400, 3600, {**HOME, **MINE})  # back home is recognized, not a third place
         self.assertEqual(walk.watcher.settled.id, home.id)
         self.assertEqual(len(walk.watcher.places), 2)
+
+    def test_more_landmarks_turning_up_are_more_of_the_same_place(self):
+        # home learned from the first two; three more are heard long enough to count a few minutes later
+        walk, tag = Walk(), {"TAG": {"manufacturer_data": FOLLOWER}}
+        first = {"TV": {"name": "Living Room TV"}, "FRIDGE": {"name": "Fridge"}}
+        later = {"BEDROOM-TV": {"name": "Bedroom TV"}, "PRINTER": {"name": "Printer"}, "SPEAKER": {"name": "Kitchen Speaker"}}
+        walk.stay(0, 120, {**first, **tag})
+        walk.stay(120, 1800, {**first, **later, **tag})
+        self.assertEqual(len(walk.watcher.places), 1)
+        self.assertEqual(walk.watcher.settled.landmarks, set(first) | set(later))  # stronger for it
+        self.assertEqual(walk.watcher.companions, set())
+        self.assertEqual(walk.verdict("TAG"), STAYING)  # half an hour at home, not following
+
+    def test_a_move_needs_two_checks_in_a_row(self):
+        walk = Walk()
+        shop = {"TILL-2": {"name": "Till 2"}, "OVEN": {"name": "Oven"}, "SIGN": {"name": "Shop Sign"}}
+        passed = {"X": {"name": "Vending Machine"}, "Y": {"name": "Parking Meter"}}
+        walk.stay(0, 900, HOME)
+        walk.stay(900, 1200, {})
+        walk.stay(1200, 1800, shop)  # the shop, once: a place of its own
+        walk.stay(1800, 2100, {})
+        walk.stay(2100, 2700, HOME)
+        walk.stay(2700, 3000, {})
+        walk.stay(3000, 3105, passed)  # a short stop: both count on just one check (at 3180)...
+        walk.stay(3105, 3195, {"X": passed["X"]})
+        walk.stay(3195, 3600, {})  # ... then the road: that run of checks is over
+        walk.stay(3600, 3781, shop)  # back at the shop, its landmarks count from 3780: one check isn't a move
+        self.assertIsNone(walk.watcher.settled)
+        walk.stay(3781, 3800, shop)
+        self.assertEqual(walk.watcher.settled.landmarks, set(shop))
+        self.assertEqual(len(walk.watcher.places), 2)
+
+    def test_a_walk_is_no_place(self):
+        # a new pair of houses every 3 minutes, each heard for 4 as you pass
+        walk = Walk(groups=["trackers", "phones"])
+        walk.stay(0, 900, {**HOME, **MINE})
+        for minute in range(15, 45):
+            houses = {f"{kind}{n}": {"name": f"{kind} {n}"} for n in range(10) for kind in ("TV", "Garden Light")
+                      if 3 * n <= minute - 15 < 3 * n + 4}
+            walk.stay(minute * 60, minute * 60 + 60, {**houses, **MINE})
+            self.assertEqual(len(walk.watcher.places), 1, f"minute {minute}")
+        self.assertIsNone(walk.watcher.settled)
+        walk.stay(2700, 2985, {**CAFE, **MINE})  # then a café: somewhere new is a place once you've stayed 5 minutes
+        self.assertIsNone(walk.watcher.settled)
+        walk.stay(2985, 3100, {**CAFE, **MINE})
+        self.assertEqual(walk.watcher.settled.landmarks, set(CAFE))
+
+    def test_devices_driven_past_are_no_landmarks(self):
+        walk = Walk()
+        street = {"LAMP": {"name": "Street Light"}, "KIOSK": {"name": "Kiosk"}}
+        walk.stay(0, 900, {**HOME, **street})  # heard all the while at home
+        walk.stay(900, 1800, {})
+        walk.stay(1800, 1860, street)  # driving past them on the way back, a minute
+        self.assertEqual(len(walk.watcher.places), 1)
+        self.assertIsNone(walk.watcher.settled)
+
+    def test_forgetting_the_ones_following_you(self):
+        walk, follower = Walk(), {"TAG": {"manufacturer_data": FOLLOWER}}
+        walk.stay(0, 900, {**HOME, **follower, "NEIGHBOUR": {"service_uuids": TILE}})
+        walk.stay(900, 1500, follower)
+        walk.stay(1500, 2400, {**CAFE, **follower})
+        self.assertEqual(walk.verdict("TAG"), FOLLOWING)
+        self.assertEqual(walk.watcher.forget_following(), 1)
+        self.assertNotIn("TAG", walk.watcher.trackers)
+        self.assertIn("NEIGHBOUR", walk.watcher.trackers)  # the others stay, and the places too
+        self.assertEqual(len(walk.watcher.places), 2)
+        walk.stay(2400, 2700, {**CAFE, **follower})  # still around: it starts over
+        self.assertEqual(walk.verdict("TAG"), PASSING)
+
+    def test_a_link_taken_back_splits_the_record(self):
+        watcher = Watcher(groups=["phones"])
+        record = watcher.trackers["NEW"] = TrackerRecord("NEW", "Phone", 0, 900, 700, {1, 2}, "phones",
+                                                         [[1, 0, 400], [2, 500, 900]])
+        watcher.mine.add("OLD")
+        watcher.mine.add("NEW")  # carried over with the link
+        watcher.take_back("OLD", ["NEW"], 450)
+        old, new = watcher.trackers["OLD"], watcher.trackers["NEW"]
+        self.assertIs(old, record)
+        self.assertEqual((old.visits, old.places, old.seen_seconds, old.last_seen), ([[1, 0, 400]], {1}, 300, 400))
+        self.assertEqual((new.visits, new.places, new.seen_seconds, new.first_seen), ([[2, 500, 900]], {2}, 400, 500))
+        self.assertEqual(watcher.mine, {"OLD"})
+
+    def test_forgetting_one_device_under_all_it_sends(self):
+        from types import SimpleNamespace
+        watcher, now = Watcher(), 1000.0
+        for address in ("FIXED", "ROTATING", "OTHER"):
+            watcher.trackers[address] = TrackerRecord(address, "Computer", now, now, group="trackers")
+        mac = SimpleNamespace(address="FIXED", partners=[(SimpleNamespace(address="ROTATING"), "same")])
+        self.assertTrue(watcher.forget_device(mac))
+        self.assertEqual(set(watcher.trackers), {"OTHER"})
+        self.assertFalse(watcher.forget_device(mac))
 
     def test_a_neighbours_tag_only_stays(self):
         walk = Walk()
@@ -174,14 +265,36 @@ class WatchForTest(unittest.TestCase):
             self.assertEqual(record and record.verdict, verdict)
 
     def test_coming_along_never_makes_a_device_yours(self):
-        walk = Walk(("trackers", "wearables"))
-        band = {"name": "Band 7", **BAND}  # named, so it's also a landmark at home
-        walk.stay(0, 900, {**HOME, "BAND": band})
-        walk.stay(900, 1500, {"BAND": band})
-        walk.stay(1500, 2400, {**CAFE, "BAND": band})
-        self.assertIn("BAND", walk.watcher.companions)  # it describes no place any more...
+        walk = Walk(("trackers", "other"))
+        gadget = {"name": "Gadget 7"}  # named and of no kind people carry, so it's also a landmark at home
+        walk.stay(0, 900, {**HOME, "GADGET": gadget})
+        walk.stay(900, 1500, {"GADGET": gadget})
+        walk.stay(1500, 2400, {**CAFE, "GADGET": gadget})
+        self.assertIn("GADGET", walk.watcher.companions)  # it describes no place any more...
         self.assertEqual(walk.watcher.mine, set())
-        self.assertEqual(walk.verdict("BAND"), FOLLOWING)  # ... and is still flagged
+        self.assertEqual(walk.verdict("GADGET"), FOLLOWING)  # ... and is still flagged
+
+    def test_ones_people_carry_make_no_place(self):
+        # in a queue of cars, strangers' phones and watches stay near you for minutes
+        walk = Walk(("trackers", "phones"))
+        strangers = {f"PHONE-{i}": {"name": f"Phone {i}"} for i in range(4)}
+        walk.stay(0, 900, {**HOME, **strangers})
+        home = walk.watcher.settled
+        walk.stay(900, 1500, strangers)  # the landmarks gone: only the phones stay
+        self.assertIsNone(walk.watcher.settled)
+        self.assertEqual(set(walk.watcher.places), {home.id})
+
+    def test_a_minute_either_side_of_a_move_isnt_following(self):
+        walk = Walk()
+        tag = {"TAG": {"manufacturer_data": FOLLOWER}}
+        walk.stay(0, 870, HOME)
+        walk.stay(870, 900, {**HOME, **tag})  # heard as you left...
+        walk.stay(900, 1500, {})
+        walk.stay(1500, 2400, CAFE)
+        walk.stay(2400, 2430, {**CAFE, **tag})  # ... and for a moment where you arrived
+        record = walk.watcher.trackers["TAG"]
+        self.assertEqual(len(record.places), 2)
+        self.assertNotEqual(record.verdict, FOLLOWING)
 
     def test_turning_a_kind_off_hides_it_but_keeps_it(self):
         walk = Walk(("trackers", "wearables"))
@@ -205,6 +318,48 @@ class WatchForTest(unittest.TestCase):
         walk.watcher.set_mine("BAND", False)
         walk.stay(600, 700, {**HOME, "BAND": BAND})
         self.assertIsNotNone(walk.watcher.record("BAND"))
+
+    def sends(self, groups, now: float = 100):
+        """A Mac: Nearby Info from an address that changes, the same from a fixed named one, and an AirPlay
+        target; and an Apple TV: an AirPlay target and Nearby Info. Each listed as one device."""
+        nearby = {0x004C: bytes.fromhex("10060b1c2d3e4f50")}
+        store, watcher = DeviceStore(), Watcher(groups=groups)
+        store.ingest([Sighting("MAC-NEARBY", -70, now, manufacturer_data=nearby),
+                      Sighting("MAC-FIXED", -70, now, name="Office MacBook", manufacturer_data=nearby),
+                      Sighting("MAC-AIRPLAY", -70, now, manufacturer_data={0x004C: bytes.fromhex("0908" + "13" * 8)}),
+                      Sighting("TV-AIRPLAY", -75, now, name="Living Room TV"),
+                      Sighting("TV-NEARBY", -75, now, manufacturer_data={0x004C: bytes.fromhex("10060a0b0c0d0e0f")})])
+        d = store.devices
+        for group_ in (("MAC-NEARBY", "MAC-FIXED", "MAC-AIRPLAY"), ("TV-AIRPLAY", "TV-NEARBY")):
+            for a in group_:
+                d[a].partners = [(d[b], None) for b in group_ if b != a]
+        return store, watcher
+
+    def test_watched_as_what_its_listed_as(self):
+        store, watcher = self.sends(("trackers", "phones"))
+        watcher.update(100, list(store.devices.values()), force=True)
+        self.assertEqual(watcher.watched(), [])  # a Mac is no phone, and a TV stays put
+        store, watcher = self.sends(("trackers", "phones", "other"))
+        watcher.update(100, list(store.devices.values()), force=True)
+        self.assertEqual([(r.address, r.kind, r.group) for r in watcher.watched()],
+                         [("MAC-FIXED", "Computer", "other")])  # once, not three times
+
+    def test_what_the_watch_knew_joins_the_listed_advertisement(self):
+        store, watcher = self.sends(("trackers", "phones", "other"))
+        nearby = store.devices["MAC-NEARBY"]
+        partners, nearby.partners = nearby.partners, []  # not known to be one device yet
+        watcher.moved(0)
+        for t in range(100, 1400, 15):
+            store.ingest([Sighting("MAC-NEARBY", -70, t, manufacturer_data=nearby.manufacturer_data)])
+            watcher.update(t, [nearby], force=True)
+        self.assertEqual(watcher.record("MAC-NEARBY").verdict, STAYING)
+        nearby.partners = partners  # now it is
+        store.ingest([Sighting("MAC-FIXED", -70, 1400, name="Office MacBook")])
+        watcher.update(1400, list(store.devices.values()), force=True)
+        self.assertNotIn("MAC-NEARBY", watcher.trackers)
+        record = watcher.record("MAC-FIXED")
+        self.assertEqual(record.verdict, STAYING)  # its time with you came along
+        self.assertEqual(record.visits[0][1], 100)
 
     def test_other_kinds_that_passed_by_are_forgotten_sooner(self):
         walk = Walk(("trackers", "phones"))
@@ -287,20 +442,31 @@ HANDOFF = {0x004C: bytes.fromhex("0c0e" + "00" * 14)}
 class AddressChangeTest(unittest.TestCase):
     """A device changing its address, the way an hour at home showed it."""
 
-    def play(self, spans: dict, until: int, names: dict | None = None):
+    def play(self, spans: dict, until: int, names: dict | None = None, extra: dict | None = None,
+             deaf: tuple | None = None):
         """spans: address -> (from, to, rssi, advert), a packet a second; an advert that's a list takes
-        turns. names: the ones macOS knows."""
-        names = names or {}
+        turns, and one that's a function says what's sent when (None: nothing). names: the ones macOS
+        knows. extra: more of an address's packet, like its TX power. deaf: (from, to) when the Mac
+        itself hears nothing, asleep."""
+        names, extra = names or {}, extra or {}
         store, linker, links = DeviceStore(), Linker(), []
         crowd = {f"FAR-{i}": (0, until, -95 - i, {0x0075: bytes([i])}) for i in range(8)}  # the faint ones around
         for t in range(until * 2):
             t /= 2
-            store.ingest([Sighting(a, rssi, t, name=names.get(a),
-                                   manufacturer_data=advert[int(t) % len(advert)] if isinstance(advert, list) else advert)
-                          for a, (start, end, rssi, advert) in {**spans, **crowd}.items() if start <= t <= end and t % 1 == 0])
+            sent = {a: (rssi, advert(t) if callable(advert) else advert[int(t) % len(advert)]
+                        if isinstance(advert, list) else advert)
+                    for a, (start, end, rssi, advert) in {**spans, **crowd}.items() if start <= t <= end and t % 1 == 0}
+            if deaf and deaf[0] < t < deaf[1]:
+                sent = {}
+            store.ingest([Sighting(a, rssi, t, name=names.get(a), **extra.get(a, {}), manufacturer_data=md)
+                          for a, (rssi, md) in sent.items() if md is not None])
+            for old in linker.taken_back(store.devices):  # the links left are the ones that stood
+                links = [x for x in links if (x[0], x[1]) != (old.address, old.superseded_by)]
+                store.take_back(old)
             for old, new, sure in linker.update(t, store.devices.values()):
                 store.hand_over(old, new, sure)
                 links.append((old.address, new.address, sure))
+        self.linker = linker
         return store, links
 
     def test_a_device_changing_its_address_is_followed(self):
@@ -339,6 +505,85 @@ class AddressChangeTest(unittest.TestCase):
     def test_one_still_talking_wasnt_replaced(self):
         _, links = self.play({"OLD": (0, 150, -69, NEARBY_INFO), "NEW": (103, 200, -69, NEARBY_INFO)}, 200)
         self.assertEqual(links, [])
+
+    def test_one_that_only_paused_is_taken_back(self):
+        # a Mac's named advertisement, whose address macOS keeps, quiet for half a minute while its
+        # twin turns up at a new address: taken for a change, until the old address talks again
+        paused = lambda t: NEARBY_INFO if t <= 100 or t >= 130 else None
+        store, links = self.play({"OLD": (0, 200, -69, paused), "NEW": (103, 200, -68, NEARBY_INFO)}, 200,
+                                 names={"OLD": "Office Mac"})
+        self.assertEqual(links, [])
+        self.assertIn(("OLD", "NEW"), self.linker._wrong)  # it was made, and taken back
+        old, new = store.devices["OLD"], store.devices["NEW"]
+        self.assertIsNone(old.superseded_by)
+        self.assertEqual((old.title, old.first_seen, old.history[0][0]), ("Office Mac", 0, 0))
+        self.assertEqual((new.earlier, new.first_seen, new.history[0][0]), ([], 103, 103))
+        self.assertNotEqual(new.title, "Office Mac")  # the name it was lent is gone
+        self.assertEqual(new.packets, 97)  # its own, from 103 s on
+        self.assertEqual(self.linker.to_dict(), {})  # and what the link taught
+
+    def test_taking_back_one_link_of_a_chain(self):
+        # A only paused, but B took over from it and later changed to C: B and C are one device, without A
+        store = DeviceStore()
+        store.ingest([Sighting("A", -60, t, name="Speaker") for t in range(0, 10)])
+        store.ingest([Sighting("B", -60, t) for t in range(20, 30)])
+        store.hand_over(store.devices["A"], store.devices["B"], 0.7)
+        store.ingest([Sighting("C", -60, t) for t in range(40, 50)])
+        store.hand_over(store.devices["B"], store.devices["C"], 0.9)
+        self.assertEqual((store.devices["C"].title, store.devices["C"].first_seen), ("Speaker", 0))
+        store.ingest([Sighting("A", -60, 60)])
+        later = store.take_back(store.devices["A"])
+        self.assertEqual([d.address for d in later], ["B", "C"])
+        c = store.devices["C"]
+        self.assertEqual((c.earlier, c.first_seen, c.packets, c.name), ([("B", 0.9)], 20, 20, None))
+        self.assertEqual([t for t, _ in c.history], list(range(20, 30)) + list(range(40, 50)))
+        self.assertEqual(store.devices["B"].superseded_by, "C")
+
+    def test_a_tx_power_not_heard_yet_doesnt_hide_it(self):
+        # a Mac leaves its TX power out of some packets: a new address may go minutes without it
+        spans = {"OLD": (0, 100, -69, NEARBY_INFO), "NEW": (103, 200, -68, NEARBY_INFO)}
+        _, links = self.play(spans, 200, extra={"OLD": {"tx_power": 12}})
+        self.assertEqual([(o, n) for o, n, _ in links], [("OLD", "NEW")])
+        _, links = self.play(spans, 200, extra={"OLD": {"tx_power": 12}, "NEW": {"tx_power": 4}})
+        self.assertEqual(links, [])  # two different ones known: two kinds of device
+
+    def test_different_service_data_is_another_kind(self):
+        # one headset sends Google's Fast Pair data from one address and another maker's from another
+        spans = {"FAST-PAIR": (0, 100, -69, {}), "OTHER": (103, 200, -68, {})}
+        _, links = self.play(spans, 200, extra={"FAST-PAIR": {"service_data": {uuid16(0xFE2C): b"\x0a\x1b"}},
+                                                "OTHER": {"service_data": {uuid16(0xFE03): b""}}})
+        self.assertEqual(links, [])
+
+    @staticmethod
+    def every(seconds: int, advert: dict):
+        return lambda t: advert if t % seconds == 0 else None
+
+    def test_one_heard_every_10_s_may_leave_a_longer_gap(self):
+        # like a Find My device near its owner: a packet every 10 s, and a minute's gap at a change
+        find_my = {0x004C: bytes.fromhex("12020001")}
+        _, links = self.play({"OLD": (0, 300, -72, self.every(10, find_my)),
+                              "NEW": (365, 700, -72, self.every(10, find_my))}, 700)
+        self.assertEqual([(o, n) for o, n, _ in links], [("OLD", "NEW")])
+
+    def test_one_heard_once_a_minute_cant_be_timed(self):
+        find_my = {0x004C: bytes.fromhex("12020001")}
+        _, links = self.play({"OLD": (0, 300, -72, self.every(60, find_my)),
+                              "NEW": (310, 900, -72, self.every(2, find_my))}, 900)
+        self.assertEqual(links, [])  # its silence looks like a change, and the change could be anywhere
+
+    def test_two_addresses_never_link_both_ways(self):
+        # two addresses at the edge of range, each heard just before and after the other
+        store, linker = DeviceStore(), Linker()
+        store.ingest([Sighting(f"FAR-{i}", -95 - i, t, manufacturer_data={0x0075: bytes([i])})
+                      for i in range(8) for t in range(17)])  # the faint ones around
+        store.ingest([Sighting("A", -69, t, manufacturer_data=NEARBY_INFO) for t in (0, 2.5)]
+                     + [Sighting("B", -69, t, manufacturer_data=NEARBY_INFO) for t in (1, 1.5, 2)])
+        links = []
+        for now in (12, 14, 16):
+            for old, new, sure in linker.update(now, store.devices.values(), force=True):
+                store.hand_over(old, new, sure)
+                links.append((old.address, new.address))
+        self.assertLessEqual(len(links), 1)
 
     @staticmethod
     def airplay(ident: bytes, salt: int) -> dict:
@@ -405,7 +650,79 @@ class AddressChangeTest(unittest.TestCase):
         self.assertIn(("TV2", "TV3"), pairs)  # by its fingerprint...
         self.assertIn(("NI2", "NI3"), pairs)  # ... and its partner along with it
         tv, ni = store.devices["TV3"], store.devices["NI3"]
-        self.assertIs(tv.partner, ni)
+        self.assertEqual(tv.partners, [(ni, "changes")])
+
+    def test_a_partner_left_over_from_a_missed_change_isnt_carried(self):
+        home = bytes.fromhex("1302c0a8004a1b58")
+        spans = {"TV0": (0, 100, -69, self.airplay(home, 0)), "TV1": (103, 200, -69, self.airplay(home, 1)),
+                 "TV2": (203, 596, -69, self.airplay(home, 2)), "TV3": (599, 700, -69, self.airplay(home, 3))}
+        spans.update({"NI0": (1, 100, -68, self.nearby(0)), "NI1": (104, 200, -68, self.nearby(1)),
+                      "NI2": (204, 300, -68, self.nearby(2)),
+                      "NI3": (400, 600, -68, self.nearby(3)),  # a change missed: 100 s of silence
+                      "NI4": (602, 700, -68, self.nearby(4))})
+        _, links = self.play(spans, 700)
+        pairs = [(o, n) for o, n, _ in links]
+        self.assertIn(("TV2", "TV3"), pairs)
+        self.assertIn(("NI3", "NI4"), pairs)  # its latest address, not NI2, quiet for 5 minutes by then
+
+    def test_a_fixed_twin_carries_the_other_through_a_change_nobody_heard(self):
+        # a Mac sends its Nearby Info from an address that changes, and the same bytes from a fixed one
+        def fixed(t):
+            if 200 < t < 330:
+                return None  # asleep: nothing heard from anyone
+            return self.nearby(1) if t <= 101 else self.nearby(2) if t <= 200 else self.nearby(3)
+        spans = {"R1": (0, 100, -69, self.nearby(1)), "R2": (103, 200, -69, self.nearby(2)),
+                 "R3": (330, 500, -69, self.nearby(3)), "FIXED": (0, 500, -68, fixed)}
+        store, links = self.play(spans, 500, names={"FIXED": "Office Mac"})
+        self.assertIn(("R2", "R3", 0.98), links)  # 130 s apart, and Nearby Info keeps no byte
+        r3, mac = store.devices["R3"], store.devices["FIXED"]
+        self.assertEqual(r3.partners, [(mac, "same")])
+        self.assertEqual(mac.partners, [(r3, "same")])
+        self.assertIs(lead(r3, mac), mac)  # listed once, by its name
+
+    def test_listed_under_one_still_heard(self):
+        store = DeviceStore()
+        store.ingest([Sighting("FIXED", -70, 0, name="Office Mac"), Sighting("ROT", -70, 100, manufacturer_data=NEARBY_INFO)])
+        fixed, rotating = store.devices["FIXED"], store.devices["ROT"]
+        fixed.partners, rotating.partners = [(rotating, "same")], [(fixed, "same")]
+        self.assertIs(listed(fixed), rotating)  # the named one has been quiet for 100 s: the other stands in
+        store.ingest([Sighting("FIXED", -70, 101, name="Office Mac")])
+        self.assertIs(listed(rotating), fixed)
+
+    def test_two_beacons_set_up_alike_stay_two(self):
+        ibeacon = {0x004C: bytes.fromhex("0215" "3b8f1c24a7e54d0b9c3f5e6a7b8c9d0e" "0001002ac5")}
+        store, links = self.play({"B1": (0, 300, -69, ibeacon), "B2": (0, 300, -75, ibeacon)}, 300)
+        self.assertEqual(links, [])
+        self.assertEqual((store.devices["B1"].partners, store.devices["B2"].partners), ([], []))
+
+    def mac_switched_off(self, off=(200, 300)):
+        """A Mac's Nearby Info (a new address when it's back), its fixed named advert, and its own Find My
+        advert, heard every 10 s, switched off and on again; a phone nearby carries on."""
+        find_my = {0x004C: bytes.fromhex("12020001")}
+        running = lambda advert: lambda t: None if off[0] < t < off[1] else advert
+        return {"NEARBY-1": (0, off[0], -70, self.nearby(1)), "NEARBY-2": (off[1] + 1, 500, -70, self.nearby(2)),
+                "FIXED": (0, 500, -70, running(self.nearby(9))),
+                "FIND-MY": (0, 500, -72, lambda t: None if off[0] - 8 < t < off[1] or t % 10 else find_my),
+                "PHONE": (0, 500, -65, {0x004C: bytes.fromhex("1005031c2d3e4f")})}
+
+    def test_going_off_and_on_together_is_one_device(self):
+        store, _ = self.play(self.mac_switched_off(), 500, names={"FIXED": "Office Mac"})
+        find_my, mac = store.devices["FIND-MY"], store.devices["FIXED"]
+        self.assertIn((mac, "cycles"), find_my.partners)
+        self.assertNotIn(store.devices["PHONE"], [p for p, _ in find_my.partners])  # it kept talking
+
+    def test_the_mac_asleep_isnt_everything_switched_off(self):
+        spans = self.mac_switched_off()
+        spans["FIXED"] = (0, 500, -70, self.nearby(9))
+        spans["FIND-MY"] = (0, 500, -72, self.every(10, {0x004C: bytes.fromhex("12020001")}))
+        store, _ = self.play(spans, 500, names={"FIXED": "Office Mac"}, deaf=(200, 300))
+        self.assertEqual(store.devices["FIND-MY"].partners, [])
+
+    def test_two_tvs_on_one_power_strip_stay_two(self):
+        off = lambda t: None if 200 < t < 300 else {}
+        store, _ = self.play({"TV": (0, 500, -70, off), "SOUNDBAR": (0, 500, -71, off)}, 500,
+                             names={"TV": "Living Room TV", "SOUNDBAR": "Soundbar"})
+        self.assertEqual(store.devices["TV"].partners, [])  # only Apple's advertisements are joined this way
 
     def test_what_is_learned_is_kept(self):
         home = bytes.fromhex("1302c0a8004a1b58")
@@ -539,6 +856,55 @@ class PacketLogTest(unittest.TestCase):
             self.assertEqual(log.export(path, {"B": "Beacon"}), 5)
             self.assertIn("Beacon", path.read_text(encoding="utf-8"))
 
+    def test_an_export_reads_back_as_heard(self):
+        log = PacketLog()
+        log.start(None)
+        heard = [Sighting("A", -60, 1.25, name="Band", tx_power=4, manufacturer_data={0x004C: bytes.fromhex("1006aabb")},
+                          service_uuids=(uuid16(0x180D),), service_data={uuid16(0xFE03): b""}, connectable=True),
+                 Sighting("B", -71, 2.5)]
+        log.add(heard)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "log.csv"
+            log.export(path)
+            self.assertEqual(read_packets(path), heard)
+
+    def test_asking_who_each_device_is(self):
+        log, store = PacketLog(), DeviceStore()
+        store.ingest([Sighting("NEAR", -50, 100, connectable=True), Sighting("FAR", -80, 100, connectable=True),
+                      Sighting("BEACON", -40, 100, connectable=False), Sighting("QUIET", -45, 90, connectable=True)])
+        devices = list(store.devices.values())
+        self.assertIsNone(log.next_to_ask(100, devices))  # not recording
+        log.start(None)
+        self.assertIsNone(log.next_to_ask(100, devices))  # recording, without Read names
+        log.read_names = True
+        self.assertEqual(log.next_to_ask(100, devices).address, "NEAR")  # the strongest that can be asked
+        log.asking("NEAR")
+        self.assertEqual(log.next_to_ask(100, devices).address, "FAR")  # each address once
+        self.assertIsNone(log.next_to_ask(100, devices, near=lambda d: d.smoothed >= -60))
+        log.stop()
+        log.start("NEAR")
+        self.assertIsNone(log.next_to_ask(100, devices))  # recording one device: only that one
+        log.answer("NEAR", identity_text([("Device name", "Mac"), ("Model", "Mac16,8")]))
+        log.asking("FAR")
+        self.assertEqual(log.read_counts(), (1, 0, 1))
+        log.answer("FAR", "error=the device didn't answer")
+        self.assertEqual(log.read_counts(), (1, 1, 0))
+
+        log.add([Sighting("NEAR", -50, 101, connectable=True), Sighting("NEW", -52, 102, connectable=True)])
+        log.address = None
+        log.add([Sighting("NEW", -52, 102, connectable=True)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "log.csv"
+            log.export(path, links={"NEW": ("NEAR", 0.834)})
+            with path.open(encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        self.assertEqual(rows[0]["identity"], "Device name=Mac; Model=Mac16,8")
+        self.assertEqual((rows[0]["changed_from"], rows[0]["change_sure"]), ("", ""))
+        self.assertEqual((rows[1]["identity"], rows[1]["changed_from"], rows[1]["change_sure"]), ("", "NEAR", "0.83"))
+        log.clear()
+        log.answer("NEAR", "Device name=Mac")  # the answer to a question thrown away
+        self.assertEqual(log.identities, {})
+
 
 class TimingAndPayloadTest(unittest.TestCase):
     def test_gaps(self):
@@ -626,6 +992,69 @@ class FakeClient:
 
     async def disconnect(self):
         pass
+
+
+class InfoClient(FakeClient):
+    """A device with a model number and a battery level."""
+    asked = []
+
+    def __init__(self, target, disconnected_callback=None, timeout=20):
+        super().__init__(target, disconnected_callback, timeout)
+        self.services = [FakeService(uuid16(0x180A), 10, [FakeChar(uuid16(0x2A24), 11, ["read"])]),
+                         FakeService(uuid16(0x180F), 20, [FakeChar(uuid16(0x2A19), 21, ["read", "notify"])])]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        pass
+
+    async def read_gatt_char(self, char):
+        InfoClient.asked.append(char.handle)
+        return bytearray(b"EX-100" if char.handle == 11 else b"\x4c")
+
+
+class QuickReadTest(unittest.TestCase):
+    def test_the_whole_look_and_just_who_it_is(self):
+        with mock.patch("bleak.BleakClient", InfoClient):
+            self.assertEqual(asyncio.run(gatt.read("ADDRESS")).summary, [("Model", "EX-100"), ("Battery", "76 %")])
+            InfoClient.asked.clear()
+            self.assertEqual(asyncio.run(gatt.read("ADDRESS", only=gatt.IDENTITY)).summary, [("Model", "EX-100")])
+        self.assertEqual(InfoClient.asked, [11])  # not the battery: that might ask to pair
+
+
+class FakeBleakScanner:
+    """Stands in for bleak's BleakScanner."""
+    made = []
+
+    def __init__(self, detection_callback=None):
+        self.started = self.stopped = 0
+        FakeBleakScanner.made.append(self)
+
+    async def start(self):
+        self.started += 1
+
+    async def stop(self):
+        self.stopped += 1
+
+
+class ScannerTest(unittest.TestCase):
+    def test_scanning_starts_again_from_scratch(self):
+        scanner, made = Scanner(), FakeBleakScanner.made
+        made.clear()
+        try:
+            with mock.patch("bleak.BleakScanner", FakeBleakScanner):
+                scanner.start()
+                deadline = time.time() + 3
+                while scanner.state != "scanning" and time.time() < deadline:
+                    time.sleep(0.02)
+                scanner.restart()  # the Mac woke up: its scan has quietly stopped
+                while not (len(made) == 2 and made[1].started) and time.time() < deadline:
+                    time.sleep(0.02)
+            self.assertEqual([(m.started, m.stopped) for m in made], [(1, 1), (1, 0)])
+            self.assertEqual(scanner.state, "scanning")
+        finally:
+            scanner.close()
 
 
 class LinkTest(unittest.TestCase):
