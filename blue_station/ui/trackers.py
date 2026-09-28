@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 from blue_station.core.decode import short_company
 from blue_station.core.devices import DeviceStore, ago_text, span_text
 from blue_station.core.links import listed
-from blue_station.core.watch import FOLLOWING, GROUPS, HEARD_WITHIN, STAYING, TrackerRecord, Watcher
+from blue_station.core.watch import FOLLOWING, GROUPS, HEARD_WITHIN, STAYING, TRAVELLING, TrackerRecord, Watcher
 from blue_station.ui.devices import HoverCards, text_matches
 from blue_station.ui import icons
 from blue_station.ui.theme import colors
@@ -27,18 +27,19 @@ from blue_station.ui.widgets import (
 TRACKER, SIGNAL, WITH_YOU, PLACES, VERDICT = range(5)
 HEADERS = ["TRACKER", "SIGNAL", "WITH YOU", "PLACES", "VERDICT"]
 RECORD_ROLE = Qt.ItemDataRole.UserRole + 1
-VERDICTS = {FOLLOWING: ("Following you", "danger"), STAYING: ("Staying near you", "warning"),
-            "passing": ("Passing by", "muted")}
-_ORDER = {FOLLOWING: 0, STAYING: 1, "passing": 2}
+VERDICTS = {FOLLOWING: ("Following you", "danger"), TRAVELLING: ("With you on the move", "warning"),
+            STAYING: ("Staying near you", "warning"), "passing": ("Passing by", "muted")}
+_ORDER = {FOLLOWING: 0, TRAVELLING: 1, STAYING: 2, "passing": 3}
 
 GROUP_ICONS = {"trackers": "tag", "headphones": "headphones", "wearables": "watch", "phones": "phone",
                "other": "generic"}
 
 EXPLAIN = ("A {noun} counts as following you once it has been with you for 10 minutes, in two different places. "
-           "Places are recognized from named devices that stay put (TVs, printers, speakers), which takes a few "
-           "minutes after "
-           "you arrive. You can also say so yourself with I've moved. If it's one of yours, open it and choose "
-           "This is mine.")
+           "Places are recognized from your phone's position when Coordinates is on (Develop), otherwise from "
+           "named devices that stay put (TVs, printers, speakers), which takes a few minutes after you arrive. "
+           "You can also say so yourself with I've moved. With your phone's position, one with you for 15 minutes "
+           "on the move, over a kilometre, is with you on the move: worth a look, though on a bus everyone is. If "
+           "it's one of yours, open it and choose This is mine.")
 MORE = (" Phones, AirPods and most watches change their Bluetooth address every 15 minutes or so. Blue Station "
         "follows them through a change it hears happen, but one that changes out of earshot starts over as a new "
         "device. Devices with a fixed address are the easiest to follow.")
@@ -138,7 +139,7 @@ class TrackerModel(QAbstractTableModel):
         self.now = now
         order = sorted(self.watcher.watched(), key=lambda r: (_ORDER[r.verdict], -r.last_seen))
         if not self.show_gone:  # ones that may be following you stay, like pinned devices on Scan
-            order = [r for r in order if r.verdict == FOLLOWING or self.around(r)]
+            order = [r for r in order if r.verdict in (FOLLOWING, TRAVELLING) or self.around(r)]
         if self.needle:
             order = [r for r in order if self.matches(r)]
         rows, shown = [], set()
@@ -329,6 +330,10 @@ class TrackersPage(QWidget):
         self.unfollow_action = self.watch_menu.addAction("Forget the ones following you…", self.forget_following)
         self.unfollow_action.setToolTip("Just those: one still around starts over, and needs 10 more minutes with "
                                         "you in two places before it's flagged again. Places and your devices stay.")
+        self.untravel_action = self.watch_menu.addAction("Forget the ones with you on the move…",
+                                                         self.forget_travelling)
+        self.untravel_action.setToolTip("Just those: a bus or a train full of people is with you on the move. "
+                                        "Places and your devices stay.")
         self.watch_menu.addAction("Forget history…", self.forget).setToolTip(
             "Forget every tracker and place seen so far")
         self.watch_menu.aboutToShow.connect(self._menu_shown)
@@ -401,6 +406,10 @@ class TrackersPage(QWidget):
         self.unfollow_action.setText(f"Forget the ones following you ({following})…" if following
                                      else "Forget the ones following you…")
         self.unfollow_action.setEnabled(bool(following))
+        travelling = len(self.watcher.travelling())
+        self.untravel_action.setText(f"Forget the ones with you on the move ({travelling})…" if travelling
+                                     else "Forget the ones with you on the move…")
+        self.untravel_action.setEnabled(bool(travelling))
 
     def _lock_last(self) -> list[str]:
         """Something is always watched: the last kind ticked can't be unticked."""
@@ -460,6 +469,17 @@ class TrackersPage(QWidget):
             self.changed.emit()
             self.tick(time.time())
 
+    def forget_travelling(self) -> None:
+        n = len(self.watcher.travelling())
+        answer = QMessageBox.question(
+            self, "Forget the ones with you on the move",
+            f"Forget the {n} device{'s' if n != 1 else ''} that were with you on the move? One that's still around "
+            "starts over.")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.watcher.forget_travelling()
+            self.changed.emit()
+            self.tick(time.time())
+
     def forget(self) -> None:
         answer = QMessageBox.question(self, "Forget history",
                                       "Forget every tracker and place Blue Station has seen so far?")
@@ -506,13 +526,19 @@ class TrackersPage(QWidget):
         watched = self.watcher.watched()
         heard = sum(1 for r in watched if (d := self.store.devices.get(r.address)) is not None and not d.gone(now))
         parts = [f"{len(watched)} {noun}{'s' if len(watched) != 1 else ''} seen, {heard} around you now"]
+        if travelling := len(self.watcher.travelling()):
+            parts.append(f"{travelling} with you on the move")
         if self.model.needle:
             parts.insert(0, f"{len(self.model.rows)} match the filter")
         settled, current = self.watcher.settled, self.watcher.current
         if settled is not None:
             marks = len(settled.landmarks)
             parts.append(f"at {self.watcher.place_name(settled.id)} since {when(settled.first_seen)}"
-                         + (f", known by {marks} landmark{'s' if marks != 1 else ''}" if marks else ", learning it"))
+                         + (", by your phone's position" if self.watcher.by_position else
+                            f", known by {marks} landmark{'s' if marks != 1 else ''}" if marks else ", learning it"))
+        elif self.watcher.by_position:
+            parts.append("on the move, by your phone's position" if self.watcher.moving else
+                         "stopped: somewhere new is a place once you've stayed 5 minutes")
         elif current is not None:
             parts.append("checking whether you've moved…")
         else:

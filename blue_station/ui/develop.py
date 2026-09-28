@@ -1,15 +1,17 @@
 """The Develop job: one device, the way its firmware's author sees it.
 Packet timing, what changed in the payload, a packet log that records
-only when asked, and a GATT explorer that reads any characteristic and
-follows notifications live."""
+only when asked (with where you were, from your phone or a GPS track),
+and a GATT explorer that reads any characteristic and follows
+notifications live."""
 import math
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFontDatabase, QPainter
+from PySide6.QtGui import QColor, QFontDatabase, QGuiApplication, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPlainTextEdit,
     QPushButton, QSizePolicy, QStackedLayout, QTableView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -19,6 +21,7 @@ from blue_station.core import gatt, names
 from blue_station.core.decode import short_company
 from blue_station.core.devices import Device, DeviceStore, gap_stats, payload_key
 from blue_station.core.packets import LIMIT, PacketLog, payload_text
+from blue_station.core.position import Track, new_word, read_gpx
 from blue_station.ui import icons
 from blue_station.ui.devices import DeviceModel, DeviceTable, HoverCards
 from blue_station.ui.theme import colors
@@ -35,6 +38,11 @@ def mono():
     font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
     font.setPointSize(11)
     return font
+
+
+def ago(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    return f"{seconds:.0f} s old" if seconds < 120 else f"{seconds / 60:.0f} min old"
 
 
 def ms(value: float) -> str:
@@ -99,18 +107,20 @@ class GapHistogram(QWidget):
 
 
 class PacketModel(QAbstractTableModel):
-    HEADERS = ["TIME", "DEVICE", "RSSI", "PAYLOAD"]
+    HEADERS = ["TIME", "DEVICE", "RSSI", "WHERE", "PAYLOAD"]
+    WHERE = 3  # where you were, from the log's positions (hidden while it has none)
 
-    def __init__(self, store: DeviceStore, parent=None):
+    def __init__(self, store: DeviceStore, track: Track, parent=None):
         super().__init__(parent)
         self.store = store
+        self.track = track
         self.rows = []
 
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.rows)
 
     def columnCount(self, parent=QModelIndex()) -> int:
-        return 0 if parent.isValid() else 4
+        return 0 if parent.isValid() else len(self.HEADERS)
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
@@ -130,8 +140,16 @@ class PacketModel(QAbstractTableModel):
                 return device.title if device else s.address
             if col == 2:
                 return str(s.rssi)
+            if col == self.WHERE:
+                where = self.track.at(s.t)
+                return f"{where[0]:.4f}, {where[1]:.4f}" if where else ""  # about 10 m: the export has more
             return payload_text(s) or (f"name: {s.name}" if s.name else "")
-        if role == Qt.ItemDataRole.FontRole and col in (0, 3):
+        if role == Qt.ItemDataRole.ToolTipRole and col == self.WHERE and (where := self.track.at(s.t)):
+            _, _, acc, gap = where
+            return ((f"±{acc:.0f} m, " if acc is not None else "")
+                    + ("the phone's own position" if gap == 0 else
+                       f"between the phone's positions, the nearest {gap:.0f} s away"))
+        if role == Qt.ItemDataRole.FontRole and col in (0, self.WHERE, 4):
             return mono()
         if role == Qt.ItemDataRole.ForegroundRole and col == 1:
             return QColor(colors()["muted"])
@@ -154,6 +172,7 @@ class DevelopPage(QWidget):
         self.store = store
         self.connect_to = connect  # address -> a gatt.Link (or the demo's)
         self.log = log
+        self.phone_word = new_word  # the word your phone posts to: the window keeps one in the settings
         self.device: Device | None = None
         self.link = None
         self._items: dict[int, QTreeWidgetItem] = {}
@@ -309,23 +328,46 @@ class DevelopPage(QWidget):
             "identity column, beside Blue Station's own guess of which addresses are one device, so you can check "
             "it. With Nearby only on (Scan), only the devices within its range.")
         self.read_names.toggled.connect(self._toggle_read_names)
-        self.log_clear = link_button("Clear", "Throw the recorded packets away")
+        self.coordinates = QCheckBox("Coordinates")
+        self.coordinates.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.coordinates.setToolTip(
+            "Where you were with each packet, from your phone: OwnTracks (free, iPhone and Android) sends its "
+            "positions to this Mac over the phone's Personal Hotspot. Open the link Link for phone copies in the "
+            "phone's browser, and tap Set up OwnTracks: Blue Station is the server OwnTracks asks for. Exported as "
+            "latitude and longitude, interpolated between the phone's positions.")
+        self.coordinates.toggled.connect(self._toggle_coordinates)
+        self.phone_url = link_button("Link for phone", "Copy this Mac's address, to open in your phone's browser: "
+                                                       "the page there sets OwnTracks up")
+        self.phone_url.clicked.connect(self.copy_phone_url)
+        self.phone_url.hide()
+        self.phone_note = ElidedLabel("", "faint")  # how fresh the phone's position is, or what the track holds
+        self.add_gpx = link_button("Add track…", "Add a GPS track (GPX) from any logging app: exported packets get "
+                                                 "its positions, where you were when each was heard")
+        self.add_gpx.clicked.connect(self.add_track_dialog)
+        self.log_clear = link_button("Clear", "Throw the recorded packets away, and the positions with them")
         self.log_clear.clicked.connect(self.clear_log)
         self.log_export = tool_button("export", "Export the recorded packets as CSV (⌘E)", 18)
         self.log_export.clicked.connect(self.export_dialog)
         bar.addStretch(1)
+        bar.addWidget(self.add_gpx)
         bar.addWidget(self.log_clear)
         bar.addWidget(self.log_export)
         box.addLayout(bar)
-        options = QHBoxLayout()  # a row of their own: half a window is narrow
+        options = QHBoxLayout()  # rows of their own: half a window is narrow
         options.setSpacing(16)
         options.addWidget(self.record_btn)
         options.addWidget(self.all_devices)
         options.addWidget(self.read_names)
         options.addStretch(1)
         box.addLayout(options)
+        where = QHBoxLayout()
+        where.setSpacing(16)
+        where.addWidget(self.coordinates)
+        where.addWidget(self.phone_url)
+        where.addWidget(self.phone_note, 1)
+        box.addLayout(where)
         self.log_stack = QStackedLayout()
-        self.log_model = PacketModel(self.store, self)
+        self.log_model = PacketModel(self.store, self.log.track, self)
         self.log_view = QTableView()
         self.log_view.setObjectName("devices")
         self.log_view.setModel(self.log_model)
@@ -338,8 +380,9 @@ class DevelopPage(QWidget):
         header.setHighlightSections(False)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
-        for col, width in ((0, 116), (1, 140), (2, 48)):
+        for col, width in ((0, 112), (1, 110), (2, 44), (PacketModel.WHERE, 146)):
             self.log_view.setColumnWidth(col, width)
+        self.log_view.setColumnHidden(PacketModel.WHERE, True)
         self.log_off = label(f"The log is off, so nothing piles up. Press Record to keep every packet of this "
                              f"device (or all of them) as it arrives, up to the last {LIMIT:,}."
                              .replace(",", " "), "empty")
@@ -433,6 +476,59 @@ class DevelopPage(QWidget):
 
     def _toggle_read_names(self, on: bool) -> None:
         self.log.read_names = on
+        self.tick(time.time())
+
+    def _toggle_coordinates(self, on: bool) -> None:
+        if not on:
+            self.log.unlisten()
+        elif error := self.log.listen(self.phone_word()):
+            self.coordinates.blockSignals(True)
+            self.coordinates.setChecked(False)
+            self.coordinates.blockSignals(False)
+            self.message.emit(f"Can't take your phone's positions: {error}.")
+        else:
+            url = self.log.phone.url()
+            self.message.emit(f"Listening for your phone at {url}." if url else
+                              "Listening for your phone, once this Mac is on a network: join the phone's "
+                              "Personal Hotspot.")
+        self.phone_url.setVisible(self.log.phone is not None)
+        self.tick(time.time())
+
+    def copy_phone_url(self) -> None:
+        url = self.log.phone.url() if self.log.phone is not None else None
+        if url is None:
+            self.message.emit("This Mac isn't on a network: join your phone's Personal Hotspot first.")
+            return
+        QGuiApplication.clipboard().setText(url)
+        self.message.emit(f"Copied {url}. On your phone, open it in the browser and tap Set up OwnTracks.")
+
+    def add_track_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Add a GPS track", str(Path.home()), "GPS track (*.gpx)")
+        if path:
+            self.add_track(Path(path))
+
+    def add_track(self, path: Path) -> None:
+        try:
+            fixes = read_gpx(path)
+        except (OSError, ET.ParseError, ValueError, TypeError) as exc:
+            self.message.emit(f"Couldn't read {path.name}: {exc}")
+            return
+        if not fixes:
+            self.message.emit(f"{path.name} has no timed track points.")
+            return
+        added, during = self.log.add_track(fixes)
+        clock = lambda t: datetime.fromtimestamp(t).strftime("%H:%M")
+        span = f"{clock(fixes[0].t)}–{clock(fixes[-1].t)}"
+        positions = f"{added} position{'s' if added != 1 else ''}"
+        rows = self.log.rows
+        if not rows:
+            text = f"Added {positions} from {path.name} ({span}): packets recorded while it covers them get them."
+        elif during:
+            text = f"Added {positions} from {path.name} ({span}), {during} of them while packets were recorded."
+        else:
+            text = (f"{path.name} runs {span}, and the packets {clock(rows[0].t)}–{clock(rows[-1].t)}: "
+                    f"none of them get a position from it.")
+        self.message.emit(text)
         self.tick(time.time())
 
     def clear_log(self) -> None:
@@ -631,6 +727,12 @@ class DevelopPage(QWidget):
 
     def _log_tick(self) -> None:
         log = self.log
+        fix = log.phone.latest if log.phone is not None else None
+        self.phone_note.setText(
+            ("waiting for your phone" if fix is None else
+             f"position {ago(time.time() - fix.t)}" + (f", ±{fix.acc:.0f} m" if fix.acc is not None else ""))
+            if log.phone is not None else f"{len(log.track):,} positions from a track".replace(",", " "))
+        self.phone_note.setVisible(log.phone is not None or bool(log.track))
         if self.record_btn.property("primary") != (not log.recording):
             self.record_btn.setText("■ Stop" if log.recording else "● Record")
             self.record_btn.setProperty("primary", not log.recording)
@@ -639,7 +741,9 @@ class DevelopPage(QWidget):
         self.record_btn.setEnabled(log.recording or self.device is not None or self.all_devices.isChecked())
         self.all_devices.setEnabled(not log.recording)
         count = len(log.rows)
-        self.log_clear.setEnabled(bool(count))
+        self.log_clear.setEnabled(bool(count or log.track))
+        if self.log_view.isColumnHidden(PacketModel.WHERE) == bool(log.track):  # shown once there are positions
+            self.log_view.setColumnHidden(PacketModel.WHERE, not log.track)
         self.log_stack.setCurrentIndex(1 if count or log.recording else 0)
         at_top = self.log_view.verticalScrollBar().value() == 0
         if log.total != self._shown_total and at_top:

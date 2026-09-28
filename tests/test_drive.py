@@ -1,5 +1,6 @@
-"""tools/drive_check.py: a made-up trip, from home to a shop and back, as a
-GPS track and the packets heard on the way. No Qt."""
+"""tools/drive_check.py and tools/add_track.py: a made-up trip, from home to
+a shop and back, as a GPS track and the packets heard on the way. No Qt."""
+import csv
 import sys
 import tempfile
 import unittest
@@ -9,7 +10,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from blue_station.core.devices import Sighting
-from tools import drive_check
+from blue_station.core.packets import PacketLog
+from blue_station.core.position import Track, read_gpx
+from tools import add_track, drive_check
 
 T0 = 1_800_000_000.0
 HOME, SHOP = (60.1700, 24.9400), (60.1700, 25.0500)  # made up, about 6 km apart
@@ -94,6 +97,35 @@ class DriveCheckTest(unittest.TestCase):
         self.assertIn("Apple device", following)  # the phone that came along
         self.assertNotIn("Car ", following)  # nobody on the road
         self.assertNotIn("60.1", text)
+
+
+class PositionsTest(unittest.TestCase):
+    def test_a_log_with_coordinates_is_its_own_track(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            track, path = Path(tmp) / "track.gpx", Path(tmp) / "log.csv"
+            gpx(track, gaps_while_standing=True)
+            log = PacketLog()
+            log.start(None)
+            log.add(packets())
+            log.add_track(read_gpx(track))
+            log.export(path)
+            key = drive_check.key_from_points(drive_check.points_from_log(path), path)
+        self.assertEqual([p for _, _, p in key["stays"]], [1, 2, 1])
+
+    def test_a_track_added_to_an_exported_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            track, path, out = Path(tmp) / "track.gpx", Path(tmp) / "log.csv", Path(tmp) / "out.csv"
+            gpx(track)
+            log = PacketLog()
+            log.start(None)
+            log.add(packets())
+            log.export(path)  # recorded without coordinates
+            count, placed = add_track.add_track(path, Track(read_gpx(track)), out)
+            with out.open(encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        self.assertEqual((count, placed), (len(rows), len(rows)))
+        shop = next(r for r in rows if r["address"].startswith(str(SHOP)))
+        self.assertEqual((shop["latitude"], shop["longitude"]), (f"{SHOP[0]:.6f}", f"{SHOP[1]:.6f}"))
 
 
 if __name__ == "__main__":

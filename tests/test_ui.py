@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -21,6 +22,7 @@ from blue_station.core.scanner import DemoScanner
 from blue_station.core.survey import HOLD
 from blue_station.ui import theme
 from blue_station.ui.devices import DEVICE, PIN, SIGNAL
+from blue_station.ui.develop import PacketModel
 from blue_station.ui.window import DEVELOP, SCAN, SURVEY, TRACKERS, MainWindow
 
 app = QApplication.instance() or QApplication([])
@@ -469,6 +471,15 @@ class TrackersJobTest(WindowCase):
         self.assertNotIn(tag.address, watcher.trackers)
         self.assertIn("NEIGHBOUR", watcher.trackers)
 
+        watcher.trackers["BUS"] = TrackerRecord("BUS", "Tile tracker", now - 1800, now, 25 * 60, set(),
+                                                travelled=[25 * 60, 9000.0])  # everyone on a bus is
+        page._menu_shown()
+        self.assertIn("(1)", page.untravel_action.text())
+        with mock.patch("blue_station.ui.trackers.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            page.forget_travelling()
+        self.assertNotIn("BUS", watcher.trackers)
+        self.assertIn("NEIGHBOUR", watcher.trackers)
+
         watcher.trackers[tag.address] = TrackerRecord(tag.address, "Find My device", now - 600, now, 60, {2})
         self.window.show_device(tag)
         self.window.tick()
@@ -501,6 +512,15 @@ class TrackersJobTest(WindowCase):
         self.assertIn("Tick Show out of range to see the 1 heard earlier", page.empty.text())
         self.window.close()
         self.assertFalse(prefs.load()["trackers_show_gone"])
+
+    def test_your_phones_position_says_where_you_are(self):
+        from blue_station.core.position import Fix
+        self.window.show_job(TRACKERS)
+        page, watcher, now = self.window.trackers, self.window.watcher, time.time()
+        watcher.add_positions([Fix(now - 60 + 10 * i, 60.0 + 0.0005 * i, 25.0, 10) for i in range(7)])  # walking
+        watcher.update(now, list(self.window.store.devices.values()), force=True)
+        self.window.tick()
+        self.assertIn("on the move, by your phone's position", page.detail.text())
 
     def test_naming_a_place_and_the_timeline(self):
         from unittest import mock
@@ -676,6 +696,47 @@ class DevelopJobTest(WindowCase):
         self.assertEqual(len(lines) - 1, len(log.rows))
         page.clear_log()
         self.assertEqual(len(log.rows), 0)
+
+    def test_coordinates_from_the_phone_and_a_track(self):
+        import urllib.request
+        page, log = self.page, self.window.log
+        log.port = 0  # any free one: the app itself may be listening on the usual one
+        page.toggle_record()
+        self.assertTrue(page.log_view.isColumnHidden(PacketModel.WHERE))  # no positions yet
+        page.coordinates.setChecked(True)
+        self.assertTrue(log.phone.listening)
+        self.assertTrue(self.window.settings["coordinates"])  # kept on: Trackers use the phone's position too
+        self.assertFalse(page.phone_url.isHidden())
+        self.assertEqual(log.phone.word, self.window.settings["phone_word"])  # kept, so the phone is told once
+        now = int(time.time())
+        body = f'{{"_type":"location","lat":60.1,"lon":24.9,"tst":{now},"acc":6}}'.encode()
+        with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{log.phone.port}/{log.phone.word}",
+                                                           data=body), timeout=5) as reply:
+            self.assertEqual(reply.status, 200)
+        self.window.tick()  # taken in whatever page is showing
+        self.assertEqual(len(log.track), 1)
+        page.tick(time.time())
+        self.assertRegex(page.phone_note.text(), r"^position [0-2] s old, ±6 m$")  # the phone's seconds are whole
+        self.scanner._last = time.time() - 2
+        self.window.tick()
+        page.tick(time.time())
+        self.assertFalse(page.log_view.isColumnHidden(PacketModel.WHERE))
+        self.assertEqual(page.log_model.data(page.log_model.index(0, PacketModel.WHERE)), "60.1000, 24.9000")
+        self.assertIn("±6 m", page.log_model.data(page.log_model.index(0, PacketModel.WHERE),
+                                                   Qt.ItemDataRole.ToolTipRole))
+        page.coordinates.setChecked(False)
+        self.assertIsNone(log.phone)
+        self.assertTrue(page.phone_url.isHidden())
+        gpx = Path(self.tmp.name) / "walk.gpx"
+        gpx.write_text('<gpx xmlns="http://www.topografix.com/GPX/1/1"><trk><trkseg>'
+                       f'<trkpt lat="60.2" lon="25.0"><time>{datetime.fromtimestamp(now + 5, timezone.utc).isoformat()}'
+                       '</time></trkpt></trkseg></trk></gpx>')
+        messages = []
+        page.message.connect(messages.append)
+        page.add_track(gpx)
+        self.assertEqual(len(log.track), 2)
+        self.assertIn("Added 1 position from walk.gpx", messages[-1])
+        self.assertEqual(page.phone_note.text(), "2 positions from a track")
 
     def test_gatt_explorer_with_notifications(self):
         page = self.page

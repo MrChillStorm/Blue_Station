@@ -24,7 +24,8 @@ from blue_station.core.alerts import GONE, Alerts
 from blue_station.core.links import Linker, listed
 from blue_station.core.devices import Device, DeviceStore, span_text
 from blue_station.core.packets import PacketLog, identity_text
-from blue_station.core.watch import DEFAULT_GROUPS, FOLLOWING, GROUPS, Watcher
+from blue_station.core.position import new_word
+from blue_station.core.watch import DEFAULT_GROUPS, FOLLOWING, GROUPS, TRAVELLING, Watcher
 from blue_station.ui import icons, theme
 from blue_station.ui.develop import DevelopPage
 from blue_station.ui.devices import DevicesPage
@@ -130,6 +131,10 @@ class MainWindow(QMainWindow):
         self.trackers = TrackersPage(self.watcher, self.store)
         self.survey = SurveyPage(self.store)
         self.develop = DevelopPage(self.store, self.scanner.connect, self.log)
+        self.develop.phone_word = self._phone_word
+        if not demo and self.settings.get("coordinates"):  # kept on: Trackers use your phone's position too
+            self.develop.coordinates.setChecked(True)
+        self.develop.coordinates.toggled.connect(self._keep_coordinates)
         self.track = TrackPage(self.scanner.read_gatt)
         self.track.watch_text = self._watch_text
         self.track.mine_state = self._mine_state
@@ -329,6 +334,7 @@ class MainWindow(QMainWindow):
         if sightings:
             self.store.ingest(sightings)
             self.log.add(sightings)
+        self.watcher.add_positions(self.log.take_positions())  # the phone's positions: where you are, for Trackers
         self._keep_scanning(now, bool(sightings))
         devices = list(self.store.devices.values())
         for old in self.linker.taken_back(self.store.devices):
@@ -503,6 +509,11 @@ class MainWindow(QMainWindow):
         if record.verdict == FOLLOWING:
             text = ("It may be following you. " + text + " To find it, walk around with this page open: the "
                     "signal gets stronger as you get closer.")
+        elif record.verdict == TRAVELLING:
+            seconds, metres = record.travelled
+            text = (f"It was with you on the move for {span_text(seconds)}, over {metres / 1000:.1f} km, by your "
+                    "phone's position: on a bus or a train that's everyone around you, anywhere else worth a look. "
+                    + text)
         if record.visits:
             text += "\n\nWith you: " + timeline(self.watcher, record, time.time())
         return text
@@ -551,6 +562,20 @@ class MainWindow(QMainWindow):
         if not self.demo:  # made-up devices aren't worth remembering
             self.settings["known"] = self.store.known
             self._save()
+
+    def _keep_coordinates(self, on: bool) -> None:
+        if not self.demo:
+            self.settings["coordinates"] = on
+            self._save()
+
+    def _phone_word(self) -> str:
+        """The word in the address your phone sends its positions to (position.py):
+        made once and kept, so the phone needs telling only once."""
+        if not self.settings.get("phone_word"):
+            self.settings["phone_word"] = new_word()
+            if not self.demo:
+                self._save()
+        return self.settings["phone_word"]
 
     def _save(self) -> None:
         try:
@@ -748,6 +773,7 @@ class MainWindow(QMainWindow):
         for page in (self.devices, self.trackers, self.survey, self.develop):
             page.hover.hide()
         self.develop.disconnect()
+        self.log.unlisten()
         self._keep_settings()
         self.scanner.close()
         if self.menubar is not None:

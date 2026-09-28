@@ -18,10 +18,12 @@ from blue_station.core.baseline import Baseline
 from blue_station.core.links import Linker, lead, listed
 from blue_station.core.devices import Device, DeviceStore, Sighting, gap_stats
 from blue_station.core.packets import PacketLog, identity_text, read as read_packets
+from blue_station.core.position import Fix, PhoneReceiver, Track, owntracks_fixes
 from blue_station.core.scanner import Scanner
 from blue_station.core.survey import COUNT, DEVICE, HOLD, NOT_HEARD, STRONGEST, Point, Survey
 from blue_station.core.decode import decode
-from blue_station.core.watch import DEFAULT_GROUPS, FOLLOWING, PASSING, STAYING, TrackerRecord, Watcher, group
+from blue_station.core.watch import (DEFAULT_GROUPS, FOLLOWING, PASSING, STAYING, TRAVELLING, TrackerRecord, Watcher,
+                                     group)
 
 
 def uuid16(short: int) -> str:
@@ -40,9 +42,13 @@ class Walk:
         self.store = DeviceStore()
         self.watcher = Watcher(groups=groups)
 
-    def stay(self, start: int, end: int, heard: dict[str, dict]) -> None:
+    def stay(self, start: int, end: int, heard: dict[str, dict], at=None) -> None:
+        """at: where your phone says you are, (latitude, longitude) or a
+        function of the time; None: no phone."""
         for t in range(start, end, 15):
             self.store.ingest([Sighting(address, -60, t, **kw) for address, kw in heard.items()])
+            if at is not None:
+                self.watcher.add_positions([Fix(t, *(at(t) if callable(at) else at), 10)])
             self.watcher.update(t, list(self.store.devices.values()))
 
     def verdict(self, address: str) -> str:
@@ -52,6 +58,18 @@ class Walk:
 HOME = {"TV": {"name": "Living Room TV"}, "FRIDGE": {"name": "Fridge"}, "PRINTER": {"name": "Printer"}}
 CAFE = {"ESPRESSO": {"name": "Espresso Machine"}, "SPEAKER": {"name": "Café Speaker"}, "TILL": {"name": "Till"}}
 MINE = {"PHONE": {"name": "My Phone"}}
+HOME_AT, SHOP_AT = (60.0, 25.0), (60.018, 25.0)  # made up, 2 km apart
+NEAR_HOME = (60.00135, 25.0)  # 150 m from home
+
+
+def walking(start: int, frm, to, metres_a_second: float = 1.0):
+    """Where you are, walking in a straight line from frm towards to."""
+    gap = ((to[0] - frm[0]) * 111_320, (to[1] - frm[1]) * 55_800)
+    length = (gap[0] ** 2 + gap[1] ** 2) ** 0.5
+    def at(t):
+        f = min(1.0, (t - start) * metres_a_second / length)
+        return frm[0] + f * (to[0] - frm[0]), frm[1] + f * (to[1] - frm[1])
+    return at
 
 
 class WatchTest(unittest.TestCase):
@@ -147,6 +165,102 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(len(walk.watcher.places), 2)
         walk.stay(2400, 2700, {**CAFE, **follower})  # still around: it starts over
         self.assertEqual(walk.verdict("TAG"), PASSING)
+
+    def houses_passed(self, walk, start, minutes, at=None):
+        """A new pair of houses every 3 minutes, each heard for 7: a slow stroll."""
+        for minute in range(minutes):
+            houses = {f"{kind}{n}": {"name": f"{kind} {n}"} for n in range(12) for kind in ("TV", "Garden Light")
+                      if 3 * n <= minute < 3 * n + 7}
+            t = start + minute * 60
+            walk.stay(t, t + 60, {**houses, **MINE}, at)
+
+    def test_with_your_phone_a_slow_stroll_is_no_place(self):
+        without = Walk(groups=["trackers", "phones"])
+        without.stay(0, 900, {**HOME, **MINE})
+        self.houses_passed(without, 900, 30)
+        self.assertGreater(len(without.watcher.places), 1)  # the landmarks alone: you seemed to stay
+        walk = Walk(groups=["trackers", "phones"])
+        walk.stay(0, 900, {**HOME, **MINE}, at=HOME_AT)
+        home = walk.watcher.settled
+        self.assertTrue(walk.watcher.by_position)
+        self.houses_passed(walk, 900, 30, at=walking(900, HOME_AT, SHOP_AT))  # but your phone says you moved
+        self.assertEqual(list(walk.watcher.places), [home.id])
+        self.assertTrue(walk.watcher.moving)
+
+    def test_with_your_phone_a_stop_is_a_place_with_few_landmarks(self):
+        walk, tag = Walk(), {"TAG": {"manufacturer_data": FOLLOWER}}
+        walk.stay(0, 900, {**HOME, **tag}, at=HOME_AT)
+        walk.stay(900, 1100, tag, at=walking(900, HOME_AT, SHOP_AT, 10))  # driving 2 km
+        walk.stay(1100, 1395, {"KIOSK": {"name": "Kiosk"}, **tag}, at=SHOP_AT)  # one landmark: never a place alone
+        self.assertIsNone(walk.watcher.settled)  # stopped, but not for 5 minutes yet
+        walk.stay(1395, 2400, {"KIOSK": {"name": "Kiosk"}, **tag}, at=SHOP_AT)
+        shop = walk.watcher.settled
+        self.assertEqual(len(walk.watcher.places), 2)
+        self.assertEqual(shop.landmarks, {"KIOSK"})
+        self.assertEqual(walk.verdict("TAG"), FOLLOWING)
+
+    def test_with_your_phone_a_spot_near_a_place_is_that_place(self):
+        walk = Walk(groups=["other"])
+        walk.stay(0, 900, HOME, at=HOME_AT)
+        home = walk.watcher.settled
+        walk.stay(900, 1050, {}, at=walking(900, HOME_AT, NEAR_HOME))
+        yard = {"LAMP": {"name": "Garden Light"}, "GATE": {"name": "Gate"}, "FRIDGE": HOME["FRIDGE"]}
+        walk.stay(1050, 1800, yard, at=NEAR_HOME)  # 150 m away, 12 minutes: still home
+        self.assertIs(walk.watcher.settled, home)
+        self.assertEqual(len(walk.watcher.places), 1)
+
+    def test_when_the_phone_goes_quiet_the_landmarks_take_over(self):
+        walk = Walk()
+        walk.stay(0, 900, HOME, at=HOME_AT)
+        home = walk.watcher.settled
+        walk.stay(900, 1500, HOME)  # no more positions
+        self.assertFalse(walk.watcher.by_position)
+        self.assertIs(walk.watcher.settled, home)
+
+    def test_with_your_phone_what_came_along_is_learned(self):
+        speaker = {"SPEAKER": {"name": "Party Box"}}
+        walk = Walk(groups=["other"])
+        walk.stay(0, 900, {**HOME, **speaker}, at=HOME_AT)
+        self.assertIn("SPEAKER", walk.watcher.settled.landmarks)
+        walk.stay(900, 1100, speaker, at=walking(900, HOME_AT, SHOP_AT, 10))
+        walk.stay(1100, 1800, {**CAFE, **speaker}, at=SHOP_AT)  # heard 2 km from home: it came along
+        self.assertIn("SPEAKER", walk.watcher.companions)
+        self.assertFalse(any("SPEAKER" in p.landmarks for p in walk.watcher.places.values()))
+
+    def test_with_you_on_the_move(self):
+        walk, tag = Walk(), {"TAG": {"manufacturer_data": FOLLOWER}}
+        stranger = {"STRANGER": {"manufacturer_data": FOLLOWER}}
+        walk.stay(0, 300, HOME, at=HOME_AT)
+        out = walking(300, HOME_AT, SHOP_AT, 1.2)
+        walk.stay(300, 720, {**tag, **stranger}, at=out)  # a stranger along the way, 7 minutes
+        walk.stay(720, 1500, tag, at=out)  # the tag all the way: 20 minutes, 1.4 km
+        self.assertEqual(walk.verdict("STRANGER"), PASSING)
+        self.assertEqual(walk.verdict("TAG"), TRAVELLING)
+        seconds, metres = walk.watcher.trackers["TAG"].travelled  # the first minute out of the door is still "stopped"
+        self.assertTrue(1100 <= seconds <= 1200 and 1300 <= metres <= 1450, (seconds, metres))
+        walk.stay(1500, 2400, {}, at=out)  # it's gone: it stays flagged, until you forget it
+        self.assertEqual(walk.verdict("TAG"), TRAVELLING)
+        self.assertEqual(walk.watcher.forget_travelling(), 1)
+        self.assertNotIn("TAG", walk.watcher.trackers)
+        self.assertIn("STRANGER", walk.watcher.trackers)
+
+        without = Walk()  # no phone: moving can't be told from staying
+        without.stay(0, 300, HOME)
+        without.stay(300, 1500, tag)
+        self.assertEqual(without.watcher.trackers["TAG"].travelled, [0.0, 0.0])
+
+    def test_a_landmark_heard_from_another_place_isnt_following(self):
+        # home's fridge, heard at a café round the corner: the places are near, the fridge didn't move
+        walk = Walk(groups=["other"])
+        walk.stay(0, 900, HOME)
+        walk.stay(900, 1200, {})
+        walk.stay(1200, 1800, CAFE)
+        walk.stay(1800, 2700, {**CAFE, "FRIDGE": HOME["FRIDGE"]})
+        record = walk.watcher.trackers["FRIDGE"]
+        self.assertEqual(len(record.places), 2)  # heard in both...
+        self.assertTrue(record.landmark)
+        self.assertEqual(record.verdict, STAYING)  # ... but it describes home: it stays put
+        self.assertTrue(Watcher(walk.watcher.to_dict()).trackers["FRIDGE"].landmark)  # remembered
 
     def test_a_link_taken_back_splits_the_record(self):
         watcher = Watcher(groups=["phones"])
@@ -835,6 +949,78 @@ class SurveyTest(unittest.TestCase):
         self.assertEqual(len(survey.points), 2)
         self.assertTrue(survey.undo())
         self.assertEqual(len(survey.points), 1)
+
+
+class PositionTest(unittest.TestCase):
+    def test_a_packet_between_two_positions_is_placed_on_the_line(self):
+        track = Track([Fix(1000, 60.0, 25.0, 5), Fix(1100, 60.002, 25.0, 12), Fix(5000, 61.0, 25.0)])
+        self.assertEqual(track.at(1000), (60.0, 25.0, 5, 0.0))  # a real position
+        lat, lon, acc, gap = track.at(1025)
+        self.assertAlmostEqual(lat, 60.0005)
+        self.assertEqual((lon, acc, gap), (25.0, 12, 25))  # the less sure of the two, and 25 s from the nearest
+        self.assertEqual(track.at(1130)[3], 30)  # a long gap after it: the nearest, if within a minute...
+        self.assertIsNone(track.at(1200))  # ... and nothing further off
+        self.assertIsNone(track.at(900))
+        self.assertEqual(track.add([Fix(1000, 0, 0), Fix(1050, 60.001, 25.0)]), 1)  # one position per moment
+
+    def test_owntracks_posts(self):
+        one = b'{"_type":"location","lat":60.1,"lon":24.9,"tst":1700000000,"acc":7,"tid":"ph"}'
+        self.assertEqual(owntracks_fixes(one), [Fix(1700000000, 60.1, 24.9, 7)])
+        queued = (b'[{"_type":"location","lat":60.1,"lon":24.9,"tst":1700000000},'
+                  b'{"_type":"transition","event":"leave"},{"_type":"location","lat":999,"lon":0,"tst":1},'
+                  b'{"_type":"location","lat":"x","lon":0,"tst":2}]')
+        self.assertEqual(owntracks_fixes(queued), [Fix(1700000000, 60.1, 24.9)])
+        self.assertEqual(owntracks_fixes(b"not json"), [])
+
+    def test_the_phone_posts_its_positions(self):
+        import base64
+        import json
+        import re
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        phone = PhoneReceiver("word42", port=0)
+        self.assertIsNone(phone.start())
+        try:
+            base = f"http://127.0.0.1:{phone.port}"
+            post = lambda path, body: urllib.request.urlopen(urllib.request.Request(
+                base + path, data=body, headers={"Content-Type": "application/json"}), timeout=5)
+            reply = post("/word42", b'{"_type":"location","lat":60.1,"lon":24.9,"tst":1700000000,"acc":7}')
+            self.assertEqual((reply.status, reply.read()), (200, b"[]"))  # what OwnTracks expects back
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                post("/guess", b'{"_type":"location","lat":1,"lon":1,"tst":1}')  # someone else's post
+            refused.exception.close()
+            with urllib.request.urlopen(base + "/word42", timeout=5) as page:  # opened in the phone's browser
+                text = page.read().decode()
+            self.assertIn("hears you", text)
+            link = re.search(r'href="(owntracks:///config\?inline=[^"]+)"', text).group(1)
+            config = json.loads(base64.b64decode(urllib.parse.unquote(link.split("inline=")[1])))
+            self.assertEqual((config["mode"], config["url"], config["monitoring"]),
+                             (3, f"{base}/word42", 2))  # HTTP mode, to where the phone reached it, Move mode
+            self.assertEqual(phone.drain(), [Fix(1700000000, 60.1, 24.9, 7)])
+            self.assertEqual(phone.drain(), [])
+            self.assertEqual(phone.latest, Fix(1700000000, 60.1, 24.9, 7))
+            self.assertIsNotNone(phone.heard)
+        finally:
+            phone.stop()
+        self.assertFalse(phone.listening)
+
+    def test_packets_are_exported_with_where_they_were_heard(self):
+        log = PacketLog()
+        log.start(None)
+        log.add([Sighting("A", -60, t) for t in (1000, 1050, 2000)])
+        self.assertEqual(log.add_track([Fix(1000, 60.0, 25.0, 5), Fix(1100, 60.002, 25.0, 5), Fix(9000, 0, 0)]), (3, 2))
+        self.assertEqual(log.add_track([Fix(9000, 0, 0)] * 50), (0, 0))  # one moment, fifty times: nothing new
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "log.csv"
+            log.export(path)
+            with path.open(encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(read_packets(path)), 3)  # still reads back
+        self.assertEqual([(r["latitude"], r["longitude"], r["position_accuracy_m"], r["position_gap_s"]) for r in rows],
+                         [("60.000000", "25.000000", "5", "0"), ("60.001000", "25.000000", "5", "50"), ("", "", "", "")])
+        log.clear()
+        self.assertEqual(len(log.track), 0)
 
 
 class PacketLogTest(unittest.TestCase):

@@ -7,7 +7,11 @@ per address: name, maker, model and the like, read over a connection.
 That's an answer key for address changes that doesn't come from Blue
 Station's own guess (links.py), which never sees it: two addresses that
 told the same identity are likely one device, two that told different
-ones are two. It's exported beside the packets, with the guess."""
+ones are two. It's exported beside the packets, with the guess.
+
+With your phone's positions (position.py: live, or a GPS track added
+afterwards), each packet is exported with where you were when it was
+heard."""
 import csv
 from collections import deque
 from datetime import datetime
@@ -16,6 +20,7 @@ from pathlib import Path
 from blue_station.core.decode import hex_bytes
 from blue_station.core.devices import Sighting
 from blue_station.core.names import pretty_uuid
+from blue_station.core.position import PORT, Fix, PhoneReceiver, Track
 
 LIMIT = 350_000  # about 45 MB, and 12 hours of a home's packets
 SHARED_MAX = 200_000  # repeats kept for sharing, before starting over
@@ -63,6 +68,9 @@ class PacketLog:
         self.identities: dict[str, str] = {}  # address -> identity_text(), or "error=why"
         self.asked: set[str] = set()
         self._shared: dict = {}  # a repeated part of a packet -> the one copy kept of it
+        self.track = Track()  # where you were: from your phone, or a GPS track added
+        self.phone: PhoneReceiver | None = None  # taking your phone's positions, while asked to
+        self.port = PORT
 
     def start(self, address: str | None) -> None:
         self.recording, self.address = True, address
@@ -76,6 +84,40 @@ class PacketLog:
         self.identities.clear()
         self.asked.clear()
         self._shared.clear()
+        self.track.clear()
+
+    # ---- where you were ------------------------------------------------------------------
+
+    def listen(self, word: str) -> str | None:
+        """Takes your phone's positions until unlisten(). None, or why it can't."""
+        if self.phone is None:
+            self.phone = PhoneReceiver(word, self.port)
+        error = self.phone.start()
+        if error:
+            self.phone = None
+        return error
+
+    def unlisten(self) -> None:
+        if self.phone is not None:
+            self.phone.stop()
+            self.take_positions()
+            self.phone = None
+
+    def take_positions(self) -> list[Fix]:
+        """The positions the phone sent since the last time: into the track, and returned."""
+        fixes = self.phone.drain() if self.phone is not None else []
+        self.track.add(fixes)
+        return fixes
+
+    def add_track(self, fixes: list[Fix]) -> tuple[int, int]:
+        """A GPS track, say from a GPX file. Returns (positions it added,
+        one per moment, and of them how many fall within the packets
+        recorded, give or take a minute)."""
+        added = self.track.add(fixes)
+        if not self.rows:
+            return added, 0
+        first, last = self.rows[0].t - 60, self.rows[-1].t + 60
+        return added, len({f.t for f in fixes if first <= f.t <= last})
 
     def add(self, sightings: list[Sighting]) -> int:
         if not self.recording:
@@ -142,7 +184,8 @@ class PacketLog:
             writer = csv.writer(f)
             writer.writerow(["time", "unix_time", "address", "device", "rssi_dbm", "name", "tx_power_dbm",
                              "connectable", "manufacturer_data", "service_uuids", "service_data",
-                             "identity", "changed_from", "change_sure"])
+                             "identity", "changed_from", "change_sure",
+                             "latitude", "longitude", "position_accuracy_m", "position_gap_s"])
             for s in self.rows:
                 writer.writerow([
                     datetime.fromtimestamp(s.t).isoformat(timespec="milliseconds"), f"{s.t:.3f}", s.address,
@@ -154,5 +197,14 @@ class PacketLog:
                     self.identities.get(s.address, ""),
                     links[s.address][0] if s.address in links else "",
                     f"{links[s.address][1]:.2f}" if s.address in links else "",
+                    *position_cells(self.track.at(s.t) if self.track else None),
                 ])
         return len(self.rows)
+
+
+def position_cells(where) -> list[str]:
+    """latitude, longitude, accuracy (m) and seconds to the nearest real position, for a CSV row."""
+    if where is None:
+        return ["", "", "", ""]
+    lat, lon, acc, gap = where
+    return [f"{lat:.6f}", f"{lon:.6f}", "" if acc is None else f"{acc:.0f}", f"{gap:.0f}"]
